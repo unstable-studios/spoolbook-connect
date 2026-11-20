@@ -245,12 +245,24 @@ func newRoutes() (*Routes, http.Handler) {
 	return rt, rt.Handler()
 }
 
-var tokenField = regexp.MustCompile(`name="token" value="([0-9a-f]+)"`)
+var tokenField = regexp.MustCompile(`name="token" value="([0-9a-f.]+)"`)
 
 func do(h http.Handler, method, target, ctype, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	return doAs(h, "user:operator", method, target, ctype, body)
+}
+
+// doAs makes a request the way the host hands one over: through
+// routesapi.Request, with the principal it authorized.
+func doAs(h http.Handler, principal, method, target, ctype, body string) *httptest.ResponseRecorder {
+	path, query, _ := strings.Cut(target, "?")
+	in := routesapi.Request{Method: method, Path: path, Query: query, Body: []byte(body), Principal: principal}
 	if ctype != "" {
-		req.Header.Set("Content-Type", ctype)
+		in.Headers = map[string][]string{"Content-Type": {ctype}}
+	}
+
+	req, err := in.HTTP(context.Background())
+	if err != nil {
+		panic(err)
 	}
 
 	w := httptest.NewRecorder()
@@ -266,7 +278,7 @@ func TestLinkRoutes(t *testing.T) {
 
 	var tok struct{ Token string }
 	_ = json.Unmarshal(do(h, http.MethodGet, "/token", "", "").Body.Bytes(), &tok)
-	if len(tok.Token) != 64 {
+	if !regexp.MustCompile(`^1\.[0-9a-f]{64}$`).MatchString(tok.Token) {
 		t.Fatalf("token = %q", tok.Token)
 	}
 
@@ -458,4 +470,78 @@ type refuser struct{}
 
 func (refuser) Send(context.Context, spoolbook.Spool, spoolbook.Update) (spoolbook.Result, error) {
 	return spoolbook.Result{}, &spoolbook.Error{Class: spoolbook.Pause, Status: 401, Code: "unauthorized"}
+}
+
+func TestSignedOutCantWrite(t *testing.T) {
+	t.Parallel()
+
+	_, h := newRoutes()
+	tok := do(h, http.MethodGet, "/token", "", "")
+
+	for _, w := range []*httptest.ResponseRecorder{
+		doAs(h, "", http.MethodGet, "/token", "", ""),
+		doAs(h, "", http.MethodPut, "/links/1?token=x", "application/json", `{"vendor":"v","filament":"f","spool":"s"}`),
+		doAs(h, "", http.MethodDelete, "/links/1?token=x", "", ""),
+		doAs(h, "", http.MethodPost, "/page", "application/x-www-form-urlencoded", "action=unlink&materials_spool=1&token=x"),
+	} {
+		if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "Sign in to Connect") {
+			t.Errorf("signed out = %d %s", w.Code, w.Body)
+		}
+	}
+
+	if tok.Header().Get("Cache-Control") != "no-store" || tok.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Errorf("token headers = %v", tok.Header())
+	}
+}
+
+func TestFormKeyRotates(t *testing.T) {
+	t.Parallel()
+
+	rt, _ := newRoutes()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
+	rt.Now = func() time.Time { return now }
+
+	old, _ := rt.formToken(ctx, "user:a")
+	if !strings.HasPrefix(old, "1.") {
+		t.Fatalf("token = %q", old)
+	}
+
+	// 30 days on: a new key, and the old token still works for a day
+	now = now.Add(KeyLife)
+	fresh, _ := rt.formToken(ctx, "user:a")
+	if !strings.HasPrefix(fresh, "2.") || fresh == old {
+		t.Fatalf("token after rotation = %q", fresh)
+	}
+
+	for _, tc := range []struct {
+		token string
+		after time.Duration
+		ok    bool
+	}{
+		{fresh, 0, true},
+		{old, 0, true},
+		{old, KeyGrace - time.Minute, true},
+		{old, KeyGrace, false},
+		{fresh, KeyGrace, true},
+		{"2.00", 0, false},
+	} {
+		at := now
+		rt.Now = func() time.Time { return at.Add(tc.after) }
+		if ok, _ := rt.tokenOK(ctx, "user:a", tc.token); ok != tc.ok {
+			t.Errorf("token %.6s… after %v: %v, want %v", tc.token, tc.after, ok, tc.ok)
+		}
+	}
+
+	// another person's token is not this one's
+	rt.Now = func() time.Time { return now }
+	if ok, _ := rt.tokenOK(ctx, "user:b", fresh); ok {
+		t.Error("user:b accepted user:a's token")
+	}
+
+	// the keys survive a restart
+	again := &Routes{KV: rt.KV, Now: rt.Now}
+	if ok, _ := again.tokenOK(ctx, "user:a", fresh); !ok {
+		t.Error("the key didn't survive a restart")
+	}
 }

@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/prusa3d/prusa-connect/sdk/routesapi"
 
@@ -40,10 +42,13 @@ type Routes struct {
 	// KV keeps the key the page's form tokens are made with.
 	KV bridge.KV
 
+	// Now is the clock for the form keys; time.Now when nil.
+	Now func() time.Time
+
 	host atomic.Pointer[string]
 
 	keyMu sync.Mutex
-	key   []byte
+	held  *formKeys
 }
 
 // SetHost sets spoolbook's host, shown on the page and in the status.
@@ -58,48 +63,136 @@ func (rt *Routes) Host() string {
 	return ""
 }
 
-const formKeyKey = "form-key"
+const formKeysKey = "form-keys"
 
-// formKey is a random key kept in the store, made on first use.
-func (rt *Routes) formKey(ctx context.Context) ([]byte, error) {
+// The form key is replaced every KeyLife, and the one before it still
+// answers for KeyGrace after.
+const (
+	KeyLife  = 30 * 24 * time.Hour
+	KeyGrace = 24 * time.Hour
+)
+
+// formKey is one generation of the key the page's tokens are made with.
+type formKey struct {
+	Epoch int       `json:"epoch"`
+	Key   []byte    `json:"key"`
+	Made  time.Time `json:"made"`
+}
+
+// formKeys are the current key and the one before it.
+type formKeys struct {
+	Current  formKey  `json:"current"`
+	Previous *formKey `json:"previous,omitempty"`
+}
+
+func (rt *Routes) now() time.Time {
+	if rt.Now != nil {
+		return rt.Now()
+	}
+
+	return time.Now()
+}
+
+// keys reads the keys, made on first use and replaced once KeyLife is up.
+func (rt *Routes) keys(ctx context.Context) (formKeys, error) {
 	rt.keyMu.Lock()
 	defer rt.keyMu.Unlock()
 
-	if rt.key != nil {
-		return rt.key, nil
-	}
-
-	key, err := rt.KV.Get(ctx, formKeyKey)
-	if errors.Is(err, bridge.ErrNotFound) {
-		key = make([]byte, 32)
-		if _, err = rand.Read(key); err == nil {
-			err = rt.KV.Put(ctx, formKeyKey, key)
+	if rt.held == nil {
+		var held formKeys
+		err := getJSON(ctx, rt.KV, formKeysKey, &held)
+		switch {
+		case errors.Is(err, bridge.ErrNotFound):
+		case err != nil:
+			return formKeys{}, err
+		default:
+			rt.held = &held
 		}
 	}
 
-	if err != nil {
-		return nil, err
+	if rt.held != nil && rt.now().Sub(rt.held.Current.Made) < KeyLife {
+		return *rt.held, nil
 	}
 
-	rt.key = key
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return formKeys{}, err
+	}
 
-	return key, nil
+	next := formKeys{Current: formKey{Epoch: 1, Key: key, Made: rt.now()}}
+	if rt.held != nil {
+		prev := rt.held.Current
+		next.Current.Epoch = prev.Epoch + 1
+		next.Previous = &prev
+	}
+
+	raw, err := json.Marshal(next)
+	if err == nil {
+		err = rt.KV.Put(ctx, formKeysKey, raw)
+	}
+
+	if err != nil {
+		return formKeys{}, err
+	}
+
+	rt.held = &next
+
+	return next, nil
 }
 
-// formToken is what the page's forms carry: bound to the person the host
-// says is asking, so another site can't post a form for them. The host passes
-// no cookie or Sec-Fetch-Site header to a module, so it can't be bound to
-// those.
+func sign(k formKey, principal string) string {
+	mac := hmac.New(sha256.New, k.Key)
+	mac.Write([]byte("page-form\x00" + principal))
+
+	return strconv.Itoa(k.Epoch) + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// formToken is what the page's forms and the link writes carry: bound to the
+// person the host says is asking, so another site can't write for them. The
+// host passes a module no cookie, Sec-Fetch-Site or custom header, so it
+// can't be bound to those.
 func (rt *Routes) formToken(ctx context.Context, principal string) (string, error) {
-	key, err := rt.formKey(ctx)
+	keys, err := rt.keys(ctx)
 	if err != nil {
 		return "", err
 	}
 
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte("page-form\x00" + principal))
+	return sign(keys.Current, principal), nil
+}
 
-	return hex.EncodeToString(mac.Sum(nil)), nil
+// tokenOK checks a token against the current key, or the previous one within
+// KeyGrace of its replacement.
+func (rt *Routes) tokenOK(ctx context.Context, principal, token string) (bool, error) {
+	keys, err := rt.keys(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if hmac.Equal([]byte(token), []byte(sign(keys.Current, principal))) {
+		return true, nil
+	}
+
+	prev := keys.Previous
+	if prev == nil || rt.now().Sub(keys.Current.Made) >= KeyGrace {
+		return false, nil
+	}
+
+	return hmac.Equal([]byte(token), []byte(sign(*prev, principal))), nil
+}
+
+func getJSON(ctx context.Context, kv bridge.KV, key string, into any) error {
+	raw, err := kv.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(raw, into)
+}
+
+// noStore is sent on everything that carries a token or the links.
+func noStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 }
 
 // Handler serves the routes.
@@ -138,6 +231,14 @@ func refuse(w http.ResponseWriter, status int, code, title string) {
 // can't ride in one.
 func (rt *Routes) guarded(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		noStore(w)
+
+		principal := routesapi.PrincipalOf(r)
+		if principal == "" {
+			refuse(w, http.StatusForbidden, "signed-out", "Sign in to Connect.")
+			return
+		}
+
 		if r.Method != http.MethodDelete {
 			ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 			if err != nil || ct != "application/json" {
@@ -146,13 +247,13 @@ func (rt *Routes) guarded(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		want, err := rt.formToken(r.Context(), routesapi.PrincipalOf(r))
+		ok, err := rt.tokenOK(r.Context(), principal, r.URL.Query().Get("token"))
 		if err != nil {
 			refuse(w, http.StatusBadGateway, "store", "Can't read this module's store. Try again.")
 			return
 		}
 
-		if !hmac.Equal([]byte(r.URL.Query().Get("token")), []byte(want)) {
+		if !ok {
 			refuse(w, http.StatusForbidden, "token", "Send the token from GET /token as ?token=.")
 			return
 		}
@@ -163,17 +264,26 @@ func (rt *Routes) guarded(next http.HandlerFunc) http.HandlerFunc {
 
 // token answers the caller's token for the write routes.
 func (rt *Routes) token(w http.ResponseWriter, r *http.Request) {
-	tok, err := rt.formToken(r.Context(), routesapi.PrincipalOf(r))
+	noStore(w)
+
+	principal := routesapi.PrincipalOf(r)
+	if principal == "" {
+		refuse(w, http.StatusForbidden, "signed-out", "Sign in to Connect.")
+		return
+	}
+
+	tok, err := rt.formToken(r.Context(), principal)
 	if err != nil {
 		refuse(w, http.StatusBadGateway, "store", "Can't read this module's store. Try again.")
 		return
 	}
 
-	w.Header().Set("Cache-Control", "no-store")
 	answer(w, http.StatusOK, map[string]string{"token": tok})
 }
 
 func (rt *Routes) listLinks(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+
 	links, err := rt.Links.List(r.Context())
 	if err != nil {
 		refuse(w, http.StatusBadGateway, "store", "Can't read the links. Try again.")
@@ -356,7 +466,7 @@ func (rt *Routes) render(w http.ResponseWriter, r *http.Request, status int, not
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	noStore(w)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Security-Policy", pageCSP)
@@ -377,8 +487,13 @@ func (rt *Routes) pagePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	want, err := rt.formToken(r.Context(), routesapi.PrincipalOf(r))
-	if err != nil || !hmac.Equal([]byte(r.PostForm.Get("token")), []byte(want)) {
+	principal := routesapi.PrincipalOf(r)
+	if principal == "" {
+		rt.render(w, r, http.StatusForbidden, "", "Sign in to Connect.")
+		return
+	}
+
+	if ok, err := rt.tokenOK(r.Context(), principal, r.PostForm.Get("token")); err != nil || !ok {
 		rt.render(w, r, http.StatusForbidden, "", "Reload the page and try again.")
 		return
 	}
