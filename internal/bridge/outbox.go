@@ -46,6 +46,9 @@ type Pause struct {
 	Status   int       `json:"status"`
 	Error    string    `json:"error"`
 	Attempts int       `json:"attempts"`
+	// Settings is a hash of the settings it was paused under: new settings
+	// lift it.
+	Settings string `json:"settings,omitempty"`
 }
 
 const (
@@ -105,6 +108,34 @@ type Outbox struct {
 	seq int64
 	// rateUntil holds every send after a 429: the limit is per token.
 	rateUntil time.Time
+	// settings is the hash of the settings in force.
+	settings string
+}
+
+// SettingsHash is what a pause remembers of the settings: a hash, so the
+// token isn't kept in the clear a second time.
+func SettingsHash(url, library, token string) string {
+	sum := sha256.Sum256([]byte(url + "\x00" + library + "\x00" + token))
+
+	return hex.EncodeToString(sum[:])
+}
+
+// UseSettings says which settings are in force. A pause made under other
+// settings is lifted; one made under these is kept, with its attempts and
+// its wait.
+func (o *Outbox) UseSettings(ctx context.Context, hash string) error {
+	o.mu.Lock()
+	o.settings = hash
+	o.mu.Unlock()
+
+	p, err := o.Paused(ctx)
+	if err != nil || p == nil || p.Settings == hash {
+		return err
+	}
+
+	o.log.Info("the settings changed; trying spoolbook again")
+
+	return o.Resume(ctx)
 }
 
 // NewOutbox returns the outbox in kv.
@@ -153,11 +184,19 @@ func (o *Outbox) Remaining(ctx context.Context, spool spoolbook.Spool, grams flo
 	}
 
 	g := grams
-
-	return putJSON(ctx, o.kv, remainingKey(spool), Entry{
+	e := Entry{
 		Key: remainingKey(spool), Spool: spool, Body: spoolbook.Update{Remaining: &g},
 		Seq: seq, NotBefore: o.now().Add(delay),
-	})
+	}
+
+	// a 404's clock runs on for the spool, not for one update
+	var older Entry
+	if getJSON(ctx, o.kv, e.Key, &older) == nil && older.MissingSince != nil {
+		e.MissingSince = older.MissingSince
+		e.NotBefore = later(e.NotBefore, older.NotBefore)
+	}
+
+	return putJSON(ctx, o.kv, e.Key, e)
 }
 
 // Print queues a print with the amount left after it. It supersedes a queued
@@ -171,16 +210,23 @@ func (o *Outbox) Print(ctx context.Context, spool spoolbook.Spool, remaining flo
 		return err
 	}
 
+	r, p := remaining, print
+	e := Entry{
+		Key: printKey(print.Print), Spool: spool, Body: spoolbook.Update{Remaining: &r, Print: &p},
+		Seq: seq, NotBefore: o.now(),
+	}
+
+	var older Entry
+	if getJSON(ctx, o.kv, remainingKey(spool), &older) == nil && older.MissingSince != nil {
+		e.MissingSince = older.MissingSince
+		e.NotBefore = older.NotBefore
+	}
+
 	if err := o.kv.Delete(ctx, remainingKey(spool)); err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
 
-	r, p := remaining, print
-
-	return putJSON(ctx, o.kv, printKey(print.Print), Entry{
-		Key: printKey(print.Print), Spool: spool, Body: spoolbook.Update{Remaining: &r, Print: &p},
-		Seq: seq, NotBefore: o.now(),
-	})
+	return putJSON(ctx, o.kv, e.Key, e)
 }
 
 // Pending returns every queued entry, oldest first.
@@ -251,6 +297,26 @@ func (o *Outbox) Paused(ctx context.Context) (*Pause, error) {
 	return &p, nil
 }
 
+// Active is the pause while it holds the queue: its wait not over, or
+// updates still waiting for the send that will tell. Nil otherwise.
+func (o *Outbox) Active(ctx context.Context) (*Pause, error) {
+	p, err := o.Paused(ctx)
+	if err != nil || p == nil {
+		return nil, err
+	}
+
+	if p.Until.After(o.now()) {
+		return p, nil
+	}
+
+	pending, err := o.Pending(ctx)
+	if err != nil || len(pending) == 0 {
+		return nil, err
+	}
+
+	return p, nil
+}
+
 // Resume lifts a pause, as new settings or a successful send do.
 func (o *Outbox) Resume(ctx context.Context) error {
 	if err := o.kv.Delete(ctx, pauseKey); err != nil && !errors.Is(err, ErrNotFound) {
@@ -261,7 +327,10 @@ func (o *Outbox) Resume(ctx context.Context) error {
 }
 
 func (o *Outbox) pause(ctx context.Context, held *Pause, failure *spoolbook.Error) time.Time {
-	p := Pause{Status: failure.Status, Error: failure.Error(), Attempts: 1}
+	o.mu.Lock()
+	p := Pause{Status: failure.Status, Error: failure.Error(), Attempts: 1, Settings: o.settings}
+	o.mu.Unlock()
+
 	if held != nil {
 		p.Attempts = held.Attempts + 1
 	}
@@ -283,6 +352,14 @@ func (o *Outbox) Ready(ctx context.Context) error {
 	_, err := o.kv.List(ctx, outboxPrefix)
 
 	return err
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
 }
 
 func sortEntries(entries []Entry) {

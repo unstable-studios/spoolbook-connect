@@ -317,6 +317,87 @@ func TestPauseCapsAtSixHours(t *testing.T) {
 	}
 }
 
+func TestPauseKeptUnderTheSameSettings(t *testing.T) {
+	t.Parallel()
+
+	o, kv, c := newOutbox()
+	ctx := context.Background()
+	same := SettingsHash("https://s.example", "lib", "tok")
+	_ = o.UseSettings(ctx, same)
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+	_, _ = o.Flush(ctx, &fakeSender{answers: []error{failed(401, 0)}})
+
+	// a restart with the same settings: still paused, same wait
+	o = NewOutbox(kv, quiet, c.now)
+	_ = o.UseSettings(ctx, same)
+	p, _ := o.Paused(ctx)
+	if p == nil || p.Attempts != 1 {
+		t.Fatalf("pause = %+v", p)
+	}
+
+	send := &fakeSender{}
+	_, _ = o.Flush(ctx, send)
+	if len(send.sent) != 0 {
+		t.Fatal("sent while paused")
+	}
+
+	// new settings lift it
+	_ = o.UseSettings(ctx, SettingsHash("https://s.example", "lib", "new token"))
+	_, _ = o.Flush(ctx, send)
+	if len(send.sent) != 1 {
+		t.Fatalf("sent %d after new settings", len(send.sent))
+	}
+}
+
+func TestActivePause(t *testing.T) {
+	t.Parallel()
+
+	o, _, c := newOutbox()
+	ctx := context.Background()
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+	_, _ = o.Flush(ctx, &fakeSender{answers: []error{failed(403, 0)}})
+
+	if p, _ := o.Active(ctx); p == nil {
+		t.Fatal("not active while waiting")
+	}
+
+	// the wait is over and the update still waits: still active
+	c.advance(PauseBase)
+	if p, _ := o.Active(ctx); p == nil {
+		t.Fatal("not active with updates waiting")
+	}
+
+	// nothing waiting any more: no notice
+	_ = o.kv.Delete(ctx, remainingKey(linkTo("s1")))
+	if p, _ := o.Active(ctx); p != nil {
+		t.Fatalf("active = %+v", p)
+	}
+}
+
+func TestMissingClockSurvivesANewerUpdate(t *testing.T) {
+	t.Parallel()
+
+	o, _, c := newOutbox()
+	ctx := context.Background()
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+	_, _ = o.Flush(ctx, &fakeSender{answers: []error{failed(404, 0)}})
+	first, _ := o.Pending(ctx)
+
+	c.advance(time.Minute)
+	_ = o.Remaining(ctx, linkTo("s1"), 490, 0)
+	left, _ := o.Pending(ctx)
+	if left[0].MissingSince == nil || !left[0].MissingSince.Equal(*first[0].MissingSince) {
+		t.Fatalf("missing since %v, was %v", left[0].MissingSince, first[0].MissingSince)
+	}
+
+	// a print for the spool keeps it too
+	_ = o.Print(ctx, linkTo("s1"), 480, spoolbook.Print{Print: PrintID("p", "j", time.Time{}, "0")})
+	left, _ = o.Pending(ctx)
+	if len(left) != 1 || left[0].MissingSince == nil {
+		t.Fatalf("pending %+v", left)
+	}
+}
+
 func TestResumeLiftsAPause(t *testing.T) {
 	t.Parallel()
 
