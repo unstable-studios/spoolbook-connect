@@ -19,10 +19,14 @@ your spoolbook library:
   twice. A print that took nothing measurable, or whose spool was swapped
   mid-print, is recorded with 0 g. A cancelled print records no print; the
   spool's amount left is still sent.
-- **A print that never settles** (Connect lost track of it, or the module was
-  down past Connect's event buffer) is forgotten when the printer starts
-  another print, when its spool leaves the tool, or after 48 hours, so it
-  can't hold that spool's updates back.
+- **A print whose settle never arrives** (a gap in the event stream, or the
+  module down past Connect's event buffer) can't hold its spool's updates
+  back. The module checks Connect's own record of the printer
+  (`device.jobs`) whenever that spool reports, and every 5 minutes: if
+  Connect's last print is this one and it ended, the print is recorded from
+  that record; if the printer has another print or none, it is forgotten. It
+  is also forgotten when the printer starts another print or its spool
+  leaves the tool. If Connect can't be asked, the bound is 48 hours.
 
 Updates wait in the module's store until spoolbook takes them, so a restart
 or a network outage doesn't lose them. Some are dropped on purpose (see
@@ -30,9 +34,13 @@ Delivery). Each print has a fixed id (SHA-256 of the printer, job, the job's
 start time and tool), so a retry or a replayed event never counts a print
 twice, and a job number a printer reuses after a reset is a new print.
 
-**Grams and timing.** At the end of a print, the module reads the tools
-every 10 s until two reads agree, for up to 2 minutes, before working out the
-grams: Materials may still be counting the last of the print. What is left of
+**Grams and timing.** A settled print is handed to a worker, so the event
+stream never waits on it, and it is kept in the store until its updates are
+queued (a restart picks it up again). The worker reads the tools every 10 s
+until the weight has moved since the first read and two reads agree, or 2
+minutes have passed: Materials may still be counting the last of the print.
+If Materials doesn't answer, it retries with backoff for up to 24 hours, then
+drops the print and logs it. What is left of
 that race: filament Materials counts more than 2 minutes after the print
 settled, or a purge or unload in that window, lands in the next amount left
 rather than in the print's grams. Either way spoolbook's amount left ends up
@@ -66,7 +74,7 @@ The install prints what the module asks for. Read it before you run it with
 `-approve`:
 
 - `observe` (as the viewer role on the organization) to follow the printers'
-  print events and the Materials events.
+  print events, read each printer's current print, and the Materials events.
 - Calls to Materials' routes (`GET /printers/tools`, `GET /spools`).
 - Connections to the host in `spoolbook_url` only.
 
@@ -101,10 +109,12 @@ Building it yourself: `sh scripts/release.sh` writes `release/` and the
 
    ```sh
    M=http://prusa-connect.local:8080/api/v1/modules/com.github.aux.unstable-studios.spoolbook-connect
-   curl -H "Authorization: Bearer $PCL_TOKEN" $M/spools
-   curl -H "Authorization: Bearer $PCL_TOKEN" -X PUT $M/links/12 \
+   A="Authorization: Bearer $PCL_TOKEN"
+   curl -H "$A" $M/spools
+   T=$(curl -s -H "$A" $M/token | sed 's/.*"token":"\([0-9a-f]*\)".*/\1/')
+   curl -H "$A" -H 'Content-Type: application/json' -X PUT "$M/links/12?token=$T" \
      -d '{"vendor":"prusament","filament":"pla-galaxy-black","spool":"a1b2"}'
-   curl -H "Authorization: Bearer $PCL_TOKEN" -X DELETE $M/links/12
+   curl -H "$A" -X DELETE "$M/links/12?token=$T"
    curl -H "Authorization: Bearer $PCL_TOKEN" $M/status
    ```
 
@@ -120,9 +130,10 @@ Building it yourself: `sh scripts/release.sh` writes `release/` and the
 - On 401 (the token was revoked or rotated, or its maker is no longer an
   editor), 403 (a library limit or role) or a redirect (`spoolbook_url`
   moved), the whole queue pauses: 15 minutes, doubling to 6 hours. Nothing
-  is dropped. `GET /status` and the links page show why. It resumes when a
-  send works, or when the module starts again (changing its settings
-  restarts it).
+  is dropped. `GET /status` and the links page show why while it holds. It
+  resumes when a send works, or when the module starts with different
+  settings (url, library or token); a restart with the same settings keeps
+  the pause and its wait.
 - On 404 (no such spool, perhaps linked before it was made in spoolbook),
   that spool's updates are kept and tried every 1 to 6 hours. After 7 days
   they are dropped and logged.
@@ -164,7 +175,10 @@ Not verified yet:
   route from a browser (its host auth) hasn't been tried. The JSON routes
   work with a Connect token. Each form carries a token bound to the person
   Connect says is asking (an HMAC with a key kept in the store), because
-  Connect passes a module no cookie or `Sec-Fetch-Site` header to check. The
+  Connect passes a module no cookie, `Sec-Fetch-Site` or custom header to
+  check (`routesapi` forwards an allow-list). `PUT` and `DELETE` on `/links`
+  take the same token as `?token=` (from `GET /token`), and `PUT` takes only
+  `Content-Type: application/json`. The
   page sends `X-Frame-Options: DENY` and a strict CSP, but Connect's docs say
   the host keeps its own security headers and drops a module's, so those may
   never reach the browser. A proper settings tab (`ui.contributes.settings`)
