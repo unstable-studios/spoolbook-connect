@@ -104,7 +104,7 @@ func TestOpenAPIIsWhatTheHostAccepts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := []string{"/links", "/links/{materials_spool}", "/page", "/spools", "/status"}
+	want := []string{"/links", "/links/{materials_spool}", "/page", "/spools", "/status", "/token"}
 	if got := f.Paths(); !slices.Equal(got, want) {
 		t.Errorf("paths = %v, want %v", got, want)
 	}

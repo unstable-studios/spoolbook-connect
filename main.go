@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/prusa3d/prusa-connect/sdk/busapi"
+	"github.com/prusa3d/prusa-connect/sdk/deviceapi"
 	"github.com/prusa3d/prusa-connect/sdk/extension"
 	"github.com/prusa3d/prusa-connect/sdk/routesapi"
 	"github.com/prusa3d/prusa-connect/sdk/stateapi"
@@ -90,6 +91,7 @@ func run() error {
 	kv := connect.KV{Records: stateapi.NewClient(conn)}
 	materials := connect.Materials{Caller: routesapi.NewClient(conn)}
 	b := bridge.New(kv, materials, log, time.Now)
+	b.Devices = connect.Devices{Fleet: deviceapi.NewClient(conn)}
 
 	wake := make(chan struct{}, 1)
 	b.Wake = func() {
@@ -125,8 +127,11 @@ func run() error {
 			routes.SetHost(client.Host())
 			log.Info("sending to spoolbook", "host", client.Host(), "library", held.Library)
 
+			settings := bridge.SettingsHash(held.SpoolbookURL, held.Library, held.Token)
+
 			go follow(ctx, conn, &connect.Dispatcher{Handler: b, KV: kv, Log: log}, log)
-			go deliver(ctx, b.Outbox, client, wake, log)
+			go deliver(ctx, b.Outbox, client, settings, wake, log)
+			go settles(ctx, b)
 		})
 
 		return nil
@@ -169,7 +174,7 @@ func follow(ctx context.Context, conn *wirerpc.Conn, d *connect.Dispatcher, log 
 
 // deliver sends the outbox when something is queued, and when the next retry
 // is due.
-func deliver(ctx context.Context, outbox *bridge.Outbox, client *spoolbook.Client, wake <-chan struct{}, log *slog.Logger) {
+func deliver(ctx context.Context, outbox *bridge.Outbox, client *spoolbook.Client, settings string, wake <-chan struct{}, log *slog.Logger) {
 	// the store answers once the host marks the module ready, just after
 	// plugin.configure
 	for wait := 100 * time.Millisecond; outbox.Ready(ctx) != nil; wait = min(wait*2, 10*time.Second) {
@@ -180,10 +185,9 @@ func deliver(ctx context.Context, outbox *bridge.Outbox, client *spoolbook.Clien
 		}
 	}
 
-	// settings arrive once per start, and a change restarts the module: try
-	// again whatever paused the queue before
-	if err := outbox.Resume(ctx); err != nil {
-		log.Warn("could not lift the pause", "error", err)
+	// a pause made under other settings is lifted; under these it holds
+	if err := outbox.UseSettings(ctx, settings); err != nil {
+		log.Warn("could not read the pause", "error", err)
 	}
 
 	for ctx.Err() == nil {
@@ -210,6 +214,19 @@ func deliver(ctx context.Context, outbox *bridge.Outbox, client *spoolbook.Clien
 		}
 		timer.Stop()
 	}
+}
+
+// settles runs the settle worker once the store answers.
+func settles(ctx context.Context, b *bridge.Bridge) {
+	for wait := 100 * time.Millisecond; b.Outbox.Ready(ctx) != nil; wait = min(wait*2, 10*time.Second) {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	b.RunSettles(ctx)
 }
 
 // spoolsFor lists Materials' spools as the person asking.

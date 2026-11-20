@@ -264,22 +264,37 @@ func TestLinkRoutes(t *testing.T) {
 
 	_, h := newRoutes()
 
+	var tok struct{ Token string }
+	_ = json.Unmarshal(do(h, http.MethodGet, "/token", "", "").Body.Bytes(), &tok)
+	if len(tok.Token) != 64 {
+		t.Fatalf("token = %q", tok.Token)
+	}
+
+	q := "?token=" + tok.Token
+	jsonType := "application/json"
+
 	cases := []struct {
-		method, target, body string
-		status               int
+		method, target, ctype, body string
+		status                      int
 	}{
-		{http.MethodPut, "/links/1", `{"vendor":"prusament","filament":"pla-galaxy-black","spool":"a1"}`, 200},
-		{http.MethodPut, "/links/0", `{"vendor":"v","filament":"f","spool":"s"}`, 400},
-		{http.MethodPut, "/links/2", `{"vendor":"v","filament":"../f","spool":"s"}`, 400},
-		{http.MethodPut, "/links/2", `nope`, 400},
-		{http.MethodDelete, "/links/2", ``, 404},
-		{http.MethodGet, "/links", ``, 200},
+		{http.MethodPut, "/links/1" + q, jsonType, `{"vendor":"prusament","filament":"pla-galaxy-black","spool":"a1"}`, 200},
+		{http.MethodPut, "/links/0" + q, jsonType, `{"vendor":"v","filament":"f","spool":"s"}`, 400},
+		{http.MethodPut, "/links/2" + q, jsonType, `{"vendor":"v","filament":"../f","spool":"s"}`, 400},
+		{http.MethodPut, "/links/2" + q, jsonType, `nope`, 400},
+		{http.MethodDelete, "/links/2" + q, "", ``, 404},
+		{http.MethodGet, "/links", "", ``, 200},
+		// what another site could send: a form, or no token
+		{http.MethodPut, "/links/3" + q, "application/x-www-form-urlencoded", `{"vendor":"v","filament":"f","spool":"s"}`, 415},
+		{http.MethodPut, "/links/3" + q, "text/plain", `{"vendor":"v","filament":"f","spool":"s"}`, 415},
+		{http.MethodPut, "/links/3", jsonType, `{"vendor":"v","filament":"f","spool":"s"}`, 403},
+		{http.MethodPut, "/links/3?token=00", jsonType, `{"vendor":"v","filament":"f","spool":"s"}`, 403},
+		{http.MethodDelete, "/links/1", "", ``, 403},
 	}
 
 	for _, tc := range cases {
-		w := do(h, tc.method, tc.target, "application/json", tc.body)
+		w := do(h, tc.method, tc.target, tc.ctype, tc.body)
 		if w.Code != tc.status {
-			t.Errorf("%s %s = %d %s, want %d", tc.method, tc.target, w.Code, w.Body, tc.status)
+			t.Errorf("%s %s (%s) = %d %s, want %d", tc.method, tc.target, tc.ctype, w.Code, w.Body, tc.status)
 		}
 	}
 
@@ -295,12 +310,24 @@ func TestLinkRoutes(t *testing.T) {
 		t.Fatalf("spools = %+v", spools.Spools)
 	}
 
-	if w := do(h, http.MethodDelete, "/links/1", "", ""); w.Code != http.StatusNoContent {
+	if w := do(h, http.MethodDelete, "/links/1"+q, "", ""); w.Code != http.StatusNoContent {
 		t.Errorf("delete = %d", w.Code)
 	}
 
 	if w := do(h, http.MethodGet, "/status", "", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"spoolbook":"spoolbook.example"`) {
 		t.Errorf("status = %d %s", w.Code, w.Body)
+	}
+}
+
+func TestTokenIsPerPerson(t *testing.T) {
+	t.Parallel()
+
+	rt, _ := newRoutes()
+	ctx := context.Background()
+	a, _ := rt.formToken(ctx, "user:a")
+	b, _ := rt.formToken(ctx, "user:b")
+	if a == b || a == "" {
+		t.Errorf("tokens %q %q", a, b)
 	}
 }
 
@@ -413,6 +440,17 @@ func TestStatusShowsAPause(t *testing.T) {
 
 	if w := do(h, http.MethodGet, "/page", "", ""); !strings.Contains(w.Body.String(), "refused this module") {
 		t.Error("the page doesn't say so")
+	}
+
+	// nothing left waiting and the wait over: no notice
+	_ = rt.Links.Put(ctx, bridge.Link{MaterialsSpool: 1, Spool: spoolbook.Spool{Vendor: "v", Filament: "f", Spool: "s"}})
+	pending, _ := rt.Outbox.Pending(ctx)
+	_ = rt.KV.Delete(ctx, pending[0].Key)
+	rt.Outbox = bridge.NewOutbox(rt.KV, quiet, func() time.Time { return time.Now().Add(7 * time.Hour) })
+	st = Status{}
+	_ = json.Unmarshal(do(rt.Handler(), http.MethodGet, "/status", "", "").Body.Bytes(), &st)
+	if st.Paused != nil {
+		t.Errorf("paused = %+v", st.Paused)
 	}
 }
 

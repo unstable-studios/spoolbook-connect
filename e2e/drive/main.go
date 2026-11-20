@@ -89,13 +89,21 @@ func main() {
 		time.Sleep(time.Second)
 	}
 	fmt.Println("assign", s, string(b))
+	s, b = do("GET", sb+"/token", nil)
+	var tok struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(b, &tok)
+	fmt.Println("token", s, len(tok.Token))
 	s, b = do("PUT", fmt.Sprintf("%s/links/%d", sb, spool), map[string]string{"vendor": "prusament", "filament": "pla-test", "spool": "s1"})
+	fmt.Println("link without token", s, string(b))
+	s, b = do("PUT", fmt.Sprintf("%s/links/%d?token=%s", sb, spool, tok.Token), map[string]string{"vendor": "prusament", "filament": "pla-test", "spool": "s1"})
 	fmt.Println("link", s, string(b))
 	// a second spool on no tool: its amount left goes on its own, after the delay
 	s, b = do("POST", mat+"/spools", map[string]any{"material_uuid": m.UUID, "remaining_weight_g": 500, "full_weight_g": 1000, "quantity": 1})
 	fmt.Println("spool 2", s, string(b))
 	_ = json.Unmarshal(b, &added)
-	s, b = do("PUT", fmt.Sprintf("%s/links/%d", sb, added.IDs[0]), map[string]string{"vendor": "prusament", "filament": "pla-test", "spool": "s2"})
+	s, b = do("PUT", fmt.Sprintf("%s/links/%d?token=%s", sb, added.IDs[0], tok.Token), map[string]string{"vendor": "prusament", "filament": "pla-test", "spool": "s2"})
 	fmt.Println("link 2", s, string(b))
 	s, b = do("PATCH", fmt.Sprintf("%s/spools/%d", mat, added.IDs[0]), map[string]any{"remaining_weight_g": 432.1})
 	fmt.Println("weigh spool 2", s, string(b)[:min(len(b), 200)])

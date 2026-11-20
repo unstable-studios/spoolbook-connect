@@ -11,6 +11,7 @@ import (
 	"errors"
 	"html/template"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"sort"
@@ -105,8 +106,9 @@ func (rt *Routes) formToken(ctx context.Context, principal string) (string, erro
 func (rt *Routes) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /links", rt.listLinks)
-	mux.HandleFunc("PUT /links/{materials_spool}", rt.putLink)
-	mux.HandleFunc("DELETE /links/{materials_spool}", rt.deleteLink)
+	mux.HandleFunc("PUT /links/{materials_spool}", rt.guarded(rt.putLink))
+	mux.HandleFunc("DELETE /links/{materials_spool}", rt.guarded(rt.deleteLink))
+	mux.HandleFunc("GET /token", rt.token)
 	mux.HandleFunc("GET /spools", rt.listSpools)
 	mux.HandleFunc("GET /status", rt.status)
 	mux.HandleFunc("GET /page", rt.page)
@@ -128,6 +130,47 @@ func answer(w http.ResponseWriter, status int, body any) {
 
 func refuse(w http.ResponseWriter, status int, code, title string) {
 	answer(w, status, problem{Code: "spoolbook-connect/" + code, Title: title})
+}
+
+// guarded holds a write to what another site can't send: a JSON body (a form
+// can't send one without a preflight) and the caller's token in the token
+// query parameter. The host passes a module no custom header, so the token
+// can't ride in one.
+func (rt *Routes) guarded(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || ct != "application/json" {
+				refuse(w, http.StatusUnsupportedMediaType, "content-type", "Send JSON (Content-Type: application/json).")
+				return
+			}
+		}
+
+		want, err := rt.formToken(r.Context(), routesapi.PrincipalOf(r))
+		if err != nil {
+			refuse(w, http.StatusBadGateway, "store", "Can't read this module's store. Try again.")
+			return
+		}
+
+		if !hmac.Equal([]byte(r.URL.Query().Get("token")), []byte(want)) {
+			refuse(w, http.StatusForbidden, "token", "Send the token from GET /token as ?token=.")
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// token answers the caller's token for the write routes.
+func (rt *Routes) token(w http.ResponseWriter, r *http.Request) {
+	tok, err := rt.formToken(r.Context(), routesapi.PrincipalOf(r))
+	if err != nil {
+		refuse(w, http.StatusBadGateway, "store", "Can't read this module's store. Try again.")
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	answer(w, http.StatusOK, map[string]string{"token": tok})
 }
 
 func (rt *Routes) listLinks(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +302,7 @@ func (rt *Routes) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paused, err := rt.Outbox.Paused(r.Context())
+	paused, err := rt.Outbox.Active(r.Context())
 	if err != nil {
 		refuse(w, http.StatusBadGateway, "store", "Can't read the queue. Try again.")
 		return
@@ -297,7 +340,7 @@ func (rt *Routes) render(w http.ResponseWriter, r *http.Request, status int, not
 
 	data.Token = token
 
-	if paused, err := rt.Outbox.Paused(r.Context()); err == nil {
+	if paused, err := rt.Outbox.Active(r.Context()); err == nil {
 		data.Paused = paused
 	}
 
@@ -336,7 +379,7 @@ func (rt *Routes) pagePost(w http.ResponseWriter, r *http.Request) {
 
 	want, err := rt.formToken(r.Context(), routesapi.PrincipalOf(r))
 	if err != nil || !hmac.Equal([]byte(r.PostForm.Get("token")), []byte(want)) {
-		rt.render(w, r, http.StatusForbidden, "", "The form expired. Try again.")
+		rt.render(w, r, http.StatusForbidden, "", "Reload the page and try again.")
 		return
 	}
 

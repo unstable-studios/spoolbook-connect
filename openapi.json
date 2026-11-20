@@ -50,7 +50,7 @@
       "put": {
         "operationId": "put-link",
         "summary": "Link a spool",
-        "description": "Links a Materials spool to a spoolbook spool, replacing its link if it has one. Its next amount left is sent.",
+        "description": "Links a Materials spool to a spoolbook spool, replacing its link if it has one. Its next amount left is sent. Takes a JSON body and the caller's token.",
         "parameters": [
           {
             "name": "materials_spool",
@@ -60,6 +60,15 @@
             "schema": {
               "type": "integer",
               "minimum": 1
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "description": "The caller's token, from GET /token.",
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -99,7 +108,7 @@
       "delete": {
         "operationId": "delete-link",
         "summary": "Unlink a spool",
-        "description": "Removes a Materials spool's link. Updates already queued still go.",
+        "description": "Removes a Materials spool's link. Updates already queued still go. Takes the caller's token.",
         "parameters": [
           {
             "name": "materials_spool",
@@ -109,6 +118,15 @@
             "schema": {
               "type": "integer",
               "minimum": 1
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "description": "The caller's token, from GET /token.",
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -204,6 +222,10 @@
                         "type": "object"
                       },
                       "description": "Each print in progress, with each tool's spool at its start."
+                    },
+                    "paused": {
+                      "type": "object",
+                      "description": "While spoolbook refuses the setup (token, role, address): why, and until when nothing goes."
                     }
                   }
                 }
@@ -288,6 +310,43 @@
               "text/html": {
                 "schema": {
                   "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/token": {
+      "get": {
+        "operationId": "read-token",
+        "summary": "The caller's token for link changes",
+        "description": "A token bound to the caller, which PUT and DELETE on /links take as the token query parameter, so another site can't change links for them.",
+        "responses": {
+          "200": {
+            "description": "The token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "token"
+                  ],
+                  "properties": {
+                    "token": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused, with a code and a title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
