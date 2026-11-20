@@ -1,0 +1,407 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "spoolbook",
+    "version": "0.1.0",
+    "description": "Links between Materials spools and spoolbook spools, and what the module is sending. Paths are relative to the module's mount."
+  },
+  "paths": {
+    "/links": {
+      "get": {
+        "operationId": "list-links",
+        "summary": "List the links",
+        "description": "Every Materials spool linked to a spoolbook spool.",
+        "responses": {
+          "200": {
+            "description": "The links.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "links"
+                  ],
+                  "properties": {
+                    "links": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Link"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused, with a code and a title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/links/{materials_spool}": {
+      "put": {
+        "operationId": "put-link",
+        "summary": "Link a spool",
+        "description": "Links a Materials spool to a spoolbook spool, replacing its link if it has one. Its next amount left is sent.",
+        "parameters": [
+          {
+            "name": "materials_spool",
+            "in": "path",
+            "required": true,
+            "description": "The Materials spool id.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpoolbookSpool"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The link.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Link"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused, with a code and a title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete-link",
+        "summary": "Unlink a spool",
+        "description": "Removes a Materials spool's link. Updates already queued still go.",
+        "parameters": [
+          {
+            "name": "materials_spool",
+            "in": "path",
+            "required": true,
+            "description": "The Materials spool id.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unlinked."
+          },
+          "default": {
+            "description": "Refused, with a code and a title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/spools": {
+      "get": {
+        "operationId": "list-spools",
+        "summary": "List Materials spools with their links",
+        "description": "Every Materials spool the caller may see, with its spoolbook link if it has one, for picking what to link.",
+        "responses": {
+          "200": {
+            "description": "The spools.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "spools"
+                  ],
+                  "properties": {
+                    "spools": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/SpoolRow"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused, with a code and a title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "read-status",
+        "summary": "What the module is doing",
+        "description": "The spoolbook host it sends to, the updates waiting to go (with the last error of each) and the prints in progress.",
+        "responses": {
+          "200": {
+            "description": "The status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "spoolbook",
+                    "pending",
+                    "printing"
+                  ],
+                  "properties": {
+                    "spoolbook": {
+                      "type": "string",
+                      "description": "The spoolbook host."
+                    },
+                    "pending": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      },
+                      "description": "Queued updates, oldest first."
+                    },
+                    "printing": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      },
+                      "description": "Each print in progress, with each tool's spool at its start."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused, with a code and a title.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/page": {
+      "get": {
+        "operationId": "read-page",
+        "summary": "The links page",
+        "description": "A plain HTML page listing Materials' spools, to link and unlink them.",
+        "responses": {
+          "200": {
+            "description": "The page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "submit-page",
+        "summary": "Link or unlink from the page",
+        "description": "Takes the page's form (action link or unlink, materials_spool, spoolbook) and answers the page again.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "link",
+                      "unlink"
+                    ]
+                  },
+                  "materials_spool": {
+                    "type": "string"
+                  },
+                  "spoolbook": {
+                    "type": "string",
+                    "description": "vendor/filament/spool, or the spool page's address."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The page, with what was wrong.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Problem": {
+        "type": "object",
+        "required": [
+          "code",
+          "title"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "spoolbook-connect/<reason>"
+          },
+          "title": {
+            "type": "string",
+            "description": "What went wrong, in English."
+          }
+        }
+      },
+      "SpoolbookSpool": {
+        "type": "object",
+        "required": [
+          "vendor",
+          "filament",
+          "spool"
+        ],
+        "description": "A spool in the spoolbook library.",
+        "properties": {
+          "vendor": {
+            "type": "string"
+          },
+          "filament": {
+            "type": "string",
+            "description": "The filament's slug."
+          },
+          "spool": {
+            "type": "string",
+            "description": "The spool's id."
+          }
+        }
+      },
+      "Link": {
+        "type": "object",
+        "required": [
+          "materials_spool",
+          "vendor",
+          "filament",
+          "spool"
+        ],
+        "properties": {
+          "materials_spool": {
+            "type": "integer"
+          },
+          "vendor": {
+            "type": "string"
+          },
+          "filament": {
+            "type": "string"
+          },
+          "spool": {
+            "type": "string"
+          },
+          "remaining": {
+            "type": "number",
+            "description": "The last amount left queued for spoolbook, in grams."
+          }
+        }
+      },
+      "SpoolRow": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "uuid": {
+            "type": "string"
+          },
+          "material_name": {
+            "type": "string"
+          },
+          "brand_name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "color_rgba": {
+            "type": "string"
+          },
+          "remaining_weight_g": {
+            "type": "number"
+          },
+          "archived_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "link": {
+            "$ref": "#/components/schemas/SpoolbookSpool"
+          }
+        }
+      }
+    }
+  }
+}
