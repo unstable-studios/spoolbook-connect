@@ -1,6 +1,6 @@
 // spoolbook-connect, by Unstable Studios. Built on Prusa Connect by Prusa
 // Research; licensed under OCL v1.1 + Micro v1 + NoSaaS v1 + SWAtt v1 (LICENSE).
-//
+
 // Command spoolbook-connect is a Prusa Connect Local module that keeps
 // spoolbook's spools in step with the Materials extension: a linked spool's
 // amount left, and the prints that used it.

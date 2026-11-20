@@ -229,10 +229,19 @@ its `sdk/v0.1.0-beta.1` tag; no checkout or `replace` is needed.
 ## License
 
 OCL v1.1 + Micro v1 + NoSaaS v1 + SWAtt v1, the same terms as Prusa Connect,
-which this module is built on: free to use, change and share for
-non-commercial use; a business may use it internally, but may not copy, sell
-or offer it as a service without a license from Unstable Studios. See
-[LICENSE](LICENSE) for the full texts. Versions 0.1.1 and earlier were
-released under the MIT License.
+which this module is built on. In short (the full texts in [LICENSE](LICENSE)
+are what count):
+
+- Non-commercial use: use, change and share it. Anything you distribute
+  that's derived from it stays under these terms and keeps the
+  "built on" attribution.
+- A business may use it internally, but may not copy, sell or offer it (or
+  its API) as a service to others without a separate license.
+- A business with more than €1M in yearly revenue needs a separate license
+  even for internal use.
+
+For a license, contact Unstable Studios; parts that come from Prusa Connect
+are Prusa Research's to license. Versions 0.1.1 and earlier were released
+under the MIT License.
 
 Built on Prusa Connect by Prusa Research.
