@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strconv"
 	"sync"
@@ -33,12 +35,49 @@ type Entry struct {
 	Attempts  int       `json:"attempts"`
 	NotBefore time.Time `json:"not_before"`
 	LastError string    `json:"last_error,omitempty"`
+	// MissingSince is when spoolbook first answered 404 for it.
+	MissingSince *time.Time `json:"missing_since,omitempty"`
+}
+
+// Pause holds the whole queue while spoolbook refuses the setup itself (a
+// revoked token, a role or limit, a moved address).
+type Pause struct {
+	Until    time.Time `json:"until"`
+	Status   int       `json:"status"`
+	Error    string    `json:"error"`
+	Attempts int       `json:"attempts"`
 }
 
 const (
 	outboxPrefix = "outbox/"
+	badPrefix    = "bad/"
 	seqKey       = "outbox-seq"
+	pauseKey     = "outbox-pause"
 )
+
+// A paused queue tries again after PauseBase, doubled each time, at most
+// PauseMax.
+const (
+	PauseBase = 15 * time.Minute
+	PauseMax  = 6 * time.Hour
+)
+
+// A spool spoolbook doesn't know is tried at least every MissingRetry, and
+// dropped after MissingFor.
+const (
+	MissingRetry = time.Hour
+	MissingMax   = 6 * time.Hour
+	MissingFor   = 7 * 24 * time.Hour
+)
+
+func pauseFor(attempt int) time.Duration {
+	d := PauseBase
+	for i := 1; i < attempt && d < PauseMax; i++ {
+		d *= 2
+	}
+
+	return min(d, PauseMax)
+}
 
 // Backoff for a retry: Base doubled per attempt, at most Max.
 const (
@@ -64,6 +103,8 @@ type Outbox struct {
 
 	mu  sync.Mutex
 	seq int64
+	// rateUntil holds every send after a 429: the limit is per token.
+	rateUntil time.Time
 }
 
 // NewOutbox returns the outbox in kv.
@@ -158,13 +199,19 @@ func (o *Outbox) pending(ctx context.Context) ([]Entry, error) {
 
 	entries := make([]Entry, 0, len(keys))
 	for _, key := range keys {
-		var e Entry
-		if err := getJSON(ctx, o.kv, key, &e); err != nil {
-			if errors.Is(err, ErrNotFound) {
-				continue
-			}
+		raw, err := o.kv.Get(ctx, key)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
 
+		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", key, err)
+		}
+
+		var e Entry
+		if err := json.Unmarshal(raw, &e); err != nil || e.Key != key {
+			o.quarantine(ctx, key, raw, err)
+			continue
 		}
 
 		entries = append(entries, e)
@@ -175,14 +222,97 @@ func (o *Outbox) pending(ctx context.Context) ([]Entry, error) {
 	return entries, nil
 }
 
+// quarantine moves a record that can't be read out of the queue, to bad/, so
+// it can't hold up the rest.
+func (o *Outbox) quarantine(ctx context.Context, key string, raw []byte, cause error) {
+	o.log.Error("unreadable queued update; moved aside", "key", key, "to", badPrefix+key, "error", cause)
+
+	if err := o.kv.Put(ctx, badPrefix+key, raw); err != nil {
+		o.log.Warn("could not keep the unreadable update", "key", key, "error", err)
+	}
+
+	if err := o.kv.Delete(ctx, key); err != nil && !errors.Is(err, ErrNotFound) {
+		o.log.Warn("could not remove the unreadable update", "key", key, "error", err)
+	}
+}
+
+// Paused returns the pause in force, nil for none.
+func (o *Outbox) Paused(ctx context.Context) (*Pause, error) {
+	var p Pause
+	err := getJSON(ctx, o.kv, pauseKey, &p)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &p, nil
+}
+
+// Resume lifts a pause, as new settings or a successful send do.
+func (o *Outbox) Resume(ctx context.Context) error {
+	if err := o.kv.Delete(ctx, pauseKey); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+
+	return nil
+}
+
+func (o *Outbox) pause(ctx context.Context, held *Pause, failure *spoolbook.Error) time.Time {
+	p := Pause{Status: failure.Status, Error: failure.Error(), Attempts: 1}
+	if held != nil {
+		p.Attempts = held.Attempts + 1
+	}
+
+	p.Until = o.now().Add(pauseFor(p.Attempts))
+
+	o.log.Error("spoolbook refused this module's setup; holding every update",
+		"status", failure.Status, "code", failure.Code, "error", failure.Error(), "until", p.Until.Format(time.RFC3339))
+
+	if err := putJSON(ctx, o.kv, pauseKey, p); err != nil {
+		o.log.Warn("could not keep the pause", "error", err)
+	}
+
+	return p.Until
+}
+
+// Ready reports whether the store answers.
+func (o *Outbox) Ready(ctx context.Context) error {
+	_, err := o.kv.List(ctx, outboxPrefix)
+
+	return err
+}
+
 func sortEntries(entries []Entry) {
 	slices.SortFunc(entries, func(a, b Entry) int { return cmp.Compare(a.Seq, b.Seq) })
 }
 
 // Flush sends what is due, oldest first. A spool whose older entry isn't sent
 // yet holds its newer ones back, so an amount left never goes out of order.
-// It answers when the next entry is due, zero for none.
+// A 429 or a paused queue stops the pass. It answers when to flush again,
+// zero for nothing queued.
 func (o *Outbox) Flush(ctx context.Context, send Sender) (time.Duration, error) {
+	until := func(t time.Time) (time.Duration, error) { return max(t.Sub(o.now()), time.Second), nil }
+
+	o.mu.Lock()
+	rate := o.rateUntil
+	o.mu.Unlock()
+
+	if rate.After(o.now()) {
+		return until(rate)
+	}
+
+	paused, err := o.Paused(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	if paused != nil && paused.Until.After(o.now()) {
+		return until(paused.Until)
+	}
+
 	entries, err := o.Pending(ctx)
 	if err != nil {
 		return 0, err
@@ -190,6 +320,11 @@ func (o *Outbox) Flush(ctx context.Context, send Sender) (time.Duration, error) 
 
 	held := map[spoolbook.Spool]bool{}
 	var next time.Time
+	soonest := func(t time.Time) {
+		if !t.IsZero() && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
 
 	for _, e := range entries {
 		if ctx.Err() != nil {
@@ -200,11 +335,9 @@ func (o *Outbox) Flush(ctx context.Context, send Sender) (time.Duration, error) 
 			continue
 		}
 
-		if now := o.now(); e.NotBefore.After(now) {
+		if e.NotBefore.After(o.now()) {
 			held[e.Spool] = true
-			if next.IsZero() || e.NotBefore.Before(next) {
-				next = e.NotBefore
-			}
+			soonest(e.NotBefore)
 
 			continue
 		}
@@ -212,28 +345,56 @@ func (o *Outbox) Flush(ctx context.Context, send Sender) (time.Duration, error) 
 		_, sendErr := send.Send(ctx, e.Spool, e.Body)
 		if sendErr == nil {
 			o.done(ctx, e)
+
+			if paused != nil {
+				o.log.Info("spoolbook takes updates again")
+				_ = o.Resume(ctx)
+				paused = nil
+			}
+
 			continue
 		}
 
 		var failure *spoolbook.Error
-		if errors.As(sendErr, &failure) && failure.Class == spoolbook.Permanent {
+		if !errors.As(sendErr, &failure) {
+			failure = &spoolbook.Error{Class: spoolbook.Retry, Err: sendErr}
+		}
+
+		switch failure.Class {
+		case spoolbook.Permanent:
 			// sent again, it would be refused again: say so once and drop it
 			o.log.Error("spoolbook refused an update; dropped",
 				"spool", e.Spool.String(), "status", failure.Status, "code", failure.Code, "error", failure.Error())
 			o.done(ctx, e)
 
 			continue
+
+		case spoolbook.Pause:
+			return until(o.pause(ctx, paused, failure))
+
+		case spoolbook.Missing:
+			held[e.Spool] = true
+			soonest(o.missing(ctx, e, failure))
+
+			continue
 		}
 
 		held[e.Spool] = true
 		wait := Backoff(e.Attempts + 1)
-		if failure != nil && failure.RetryAfter > wait {
-			wait = failure.RetryAfter
+		if failure.Status == http.StatusTooManyRequests {
+			wait = max(wait, min(failure.RetryAfter, spoolbook.MaxRetryAfter))
 		}
 
 		at := o.retry(ctx, e, wait, sendErr)
-		if !at.IsZero() && (next.IsZero() || at.Before(next)) {
-			next = at
+		soonest(at)
+
+		if failure.Status == http.StatusTooManyRequests {
+			// the limit is the token's: nothing else goes either
+			o.mu.Lock()
+			o.rateUntil = o.now().Add(wait)
+			o.mu.Unlock()
+
+			return until(o.now().Add(wait))
 		}
 	}
 
@@ -241,7 +402,29 @@ func (o *Outbox) Flush(ctx context.Context, send Sender) (time.Duration, error) 
 		return 0, nil
 	}
 
-	return max(next.Sub(o.now()), time.Second), nil
+	return until(next)
+}
+
+// missing keeps an update for a spool spoolbook doesn't know, tried slowly,
+// and drops it after MissingFor.
+func (o *Outbox) missing(ctx context.Context, e Entry, failure *spoolbook.Error) time.Time {
+	since := o.now()
+	if e.MissingSince != nil {
+		since = *e.MissingSince
+	}
+
+	if o.now().Sub(since) >= MissingFor {
+		o.log.Error("spoolbook has no such spool; update dropped after a week",
+			"spool", e.Spool.String(), "since", since.Format(time.RFC3339))
+		o.done(ctx, e)
+
+		return time.Time{}
+	}
+
+	e.MissingSince = &since
+	wait := min(max(Backoff(e.Attempts+1), MissingRetry), MissingMax)
+
+	return o.retry(ctx, e, wait, failure)
 }
 
 // done removes a sent entry, unless a newer one replaced it meanwhile.
@@ -272,6 +455,7 @@ func (o *Outbox) retry(ctx context.Context, e Entry, wait time.Duration, cause e
 	e.Attempts++
 	e.NotBefore = o.now().Add(wait)
 	e.LastError = cause.Error()
+	e.MissingSince = cmp.Or(e.MissingSince, held.MissingSince)
 
 	if e.Attempts == 1 || e.Attempts%10 == 0 {
 		o.log.Warn("spoolbook update failed; will retry",

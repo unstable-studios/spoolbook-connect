@@ -81,8 +81,8 @@ func TestFlushRetryClassification(t *testing.T) {
 		{"503", failed(503, 0), true, 30 * time.Second},
 		{"409", failed(409, 0), true, 30 * time.Second},
 		{"network", networkDown, true, 30 * time.Second},
-		{"401 dropped", failed(401, 0), false, 0},
-		{"404 dropped", failed(404, 0), false, 0},
+		{"429 Retry-After capped at an hour", failed(http.StatusTooManyRequests, 5*time.Hour), true, time.Hour},
+		{"404 kept, tried slowly", failed(404, 0), true, MissingRetry},
 		{"413 dropped", failed(413, 0), false, 0},
 		{"422 dropped", failed(422, 0), false, 0},
 		{"400 dropped", failed(400, 0), false, 0},
@@ -177,7 +177,7 @@ func TestFlushKeepsEachSpoolInOrder(t *testing.T) {
 
 	o, _, _ := newOutbox()
 	ctx := context.Background()
-	p := spoolbook.Print{Print: PrintID("p", "j", "0"), Grams: 10}
+	p := spoolbook.Print{Print: PrintID("p", "j", time.Time{}, "0"), Grams: 10}
 	_ = o.Print(ctx, linkTo("s1"), 790, p)
 	_ = o.Remaining(ctx, linkTo("s1"), 780, 0)
 	_ = o.Remaining(ctx, linkTo("s2"), 300, 0)
@@ -217,7 +217,7 @@ func TestOutboxSurvivesARestart(t *testing.T) {
 
 	o, kv, c := newOutbox()
 	ctx := context.Background()
-	_ = o.Print(ctx, linkTo("s1"), 790, spoolbook.Print{Print: PrintID("p", "j", "0"), Grams: 10})
+	_ = o.Print(ctx, linkTo("s1"), 790, spoolbook.Print{Print: PrintID("p", "j", time.Time{}, "0"), Grams: 10})
 
 	// a new process over the same store: entries kept, order still rising
 	o = NewOutbox(kv, quiet, c.now)
@@ -244,11 +244,183 @@ func TestPrintIsKeptOncePerID(t *testing.T) {
 
 	o, _, _ := newOutbox()
 	ctx := context.Background()
-	p := spoolbook.Print{Print: PrintID("p", "j", "0"), Grams: 10}
+	p := spoolbook.Print{Print: PrintID("p", "j", time.Time{}, "0"), Grams: 10}
 	_ = o.Print(ctx, linkTo("s1"), 790, p)
 	_ = o.Print(ctx, linkTo("s1"), 790, p)
 
 	if left, _ := o.Pending(ctx); len(left) != 1 {
 		t.Fatalf("pending %+v", left)
+	}
+}
+
+func TestPauseHoldsTheQueueUntilASendWorks(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{401, 403, 302} {
+		o, _, c := newOutbox()
+		ctx := context.Background()
+		_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+		_ = o.Remaining(ctx, linkTo("s2"), 300, 0)
+
+		send := &fakeSender{answers: []error{failed(status, 0)}}
+		wait, err := o.Flush(ctx, send)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// the pass stops: s2 wasn't tried, nothing dropped, the pause shows
+		if len(send.sent) != 1 || wait != PauseBase {
+			t.Fatalf("%d: sent %d, wait %v", status, len(send.sent), wait)
+		}
+
+		if left, _ := o.Pending(ctx); len(left) != 2 {
+			t.Fatalf("%d: pending %+v", status, left)
+		}
+
+		p, _ := o.Paused(ctx)
+		if p == nil || p.Status != status || p.Error == "" {
+			t.Fatalf("%d: pause %+v", status, p)
+		}
+
+		// still paused: nothing goes
+		c.advance(PauseBase / 2)
+		_, _ = o.Flush(ctx, send)
+		if len(send.sent) != 1 {
+			t.Fatalf("%d: sent while paused", status)
+		}
+
+		// refused again: a longer pause
+		c.advance(PauseBase)
+		send.answers = []error{failed(status, 0)}
+		if wait, _ = o.Flush(ctx, send); wait != 2*PauseBase {
+			t.Fatalf("%d: second pause %v", status, wait)
+		}
+
+		// then it works: the pause lifts and everything goes
+		c.advance(2 * PauseBase)
+		_, _ = o.Flush(ctx, send)
+		if left, _ := o.Pending(ctx); len(left) != 0 {
+			t.Fatalf("%d: pending %+v", status, left)
+		}
+
+		if p, _ := o.Paused(ctx); p != nil {
+			t.Fatalf("%d: still paused", status)
+		}
+	}
+}
+
+func TestPauseCapsAtSixHours(t *testing.T) {
+	t.Parallel()
+
+	if pauseFor(1) != PauseBase || pauseFor(3) != 4*PauseBase || pauseFor(10) != PauseMax {
+		t.Errorf("pauseFor: %v %v %v", pauseFor(1), pauseFor(3), pauseFor(10))
+	}
+}
+
+func TestResumeLiftsAPause(t *testing.T) {
+	t.Parallel()
+
+	o, _, _ := newOutbox()
+	ctx := context.Background()
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+	_, _ = o.Flush(ctx, &fakeSender{answers: []error{failed(401, 0)}})
+
+	if err := o.Resume(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	send := &fakeSender{}
+	_, _ = o.Flush(ctx, send)
+	if len(send.sent) != 1 {
+		t.Fatalf("sent %d after Resume", len(send.sent))
+	}
+}
+
+func TestMissingSpoolIsDroppedAfterAWeek(t *testing.T) {
+	t.Parallel()
+
+	o, _, c := newOutbox()
+	ctx := context.Background()
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+	_ = o.Remaining(ctx, linkTo("s2"), 300, 0)
+
+	send := &fakeSender{}
+	for range 200 {
+		send.answers = []error{failed(404, 0)}
+		wait, _ := o.Flush(ctx, send)
+
+		left, _ := o.Pending(ctx)
+		if len(left) == 0 || left[0].Spool != linkTo("s1") {
+			break
+		}
+
+		if wait < MissingRetry || wait > MissingMax {
+			t.Fatalf("missing retry in %v", wait)
+		}
+
+		c.advance(wait)
+	}
+
+	left, _ := o.Pending(ctx)
+	if len(left) != 0 {
+		t.Fatalf("pending %+v", left)
+	}
+
+	if c.now().Sub(newClock().now()) < MissingFor {
+		t.Errorf("dropped after %v", c.now().Sub(newClock().now()))
+	}
+}
+
+func TestRateLimitStopsThePass(t *testing.T) {
+	t.Parallel()
+
+	o, _, c := newOutbox()
+	ctx := context.Background()
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+	_ = o.Remaining(ctx, linkTo("s2"), 300, 0)
+
+	send := &fakeSender{answers: []error{failed(429, 2*time.Minute)}}
+	wait, _ := o.Flush(ctx, send)
+	if len(send.sent) != 1 || wait != 2*time.Minute {
+		t.Fatalf("sent %d, wait %v", len(send.sent), wait)
+	}
+
+	// s2 isn't sent before the limit lifts either
+	c.advance(time.Minute)
+	_, _ = o.Flush(ctx, send)
+	if len(send.sent) != 1 {
+		t.Fatal("sent during the rate limit")
+	}
+
+	c.advance(time.Minute)
+	_, _ = o.Flush(ctx, send)
+	if len(send.sent) != 3 {
+		t.Fatalf("sent %d after the limit", len(send.sent))
+	}
+}
+
+func TestCorruptRecordIsMovedAside(t *testing.T) {
+	t.Parallel()
+
+	o, kv, _ := newOutbox()
+	ctx := context.Background()
+	_ = kv.Put(ctx, outboxPrefix+"r/garbage", []byte("{not json"))
+	_ = o.Remaining(ctx, linkTo("s1"), 500, 0)
+
+	send := &fakeSender{}
+	if _, err := o.Flush(ctx, send); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(send.sent) != 1 {
+		t.Fatalf("sent %d", len(send.sent))
+	}
+
+	if raw, err := kv.Get(ctx, badPrefix+outboxPrefix+"r/garbage"); err != nil || string(raw) != "{not json" {
+		t.Errorf("quarantined %q, %v", raw, err)
+	}
+
+	if _, err := kv.Get(ctx, outboxPrefix+"r/garbage"); err != ErrNotFound {
+		t.Errorf("still queued: %v", err)
 	}
 }

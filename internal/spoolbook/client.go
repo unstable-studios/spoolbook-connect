@@ -86,9 +86,18 @@ type Class int
 const (
 	// Retry means try again later: 429, 5xx, 409 or the network.
 	Retry Class = iota
-	// Permanent means sending it again won't help: 400, 401, 403, 404, 413, 422.
+	// Permanent means sending it again won't help: 400, 413, 422.
 	Permanent
+	// Pause means the setup is wrong until someone fixes it: 401 (token
+	// revoked or rotated), 403 (limits, or the token maker's role) or a
+	// redirect (spoolbook_url moved). Nothing can go until then.
+	Pause
+	// Missing is a 404: no such spool, perhaps not made in spoolbook yet.
+	Missing
 )
+
+// MaxRetryAfter caps what a 429's Retry-After can ask for.
+const MaxRetryAfter = time.Hour
 
 // Error is a failed write.
 type Error struct {
@@ -122,12 +131,16 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
-// Classify sorts a status: retry, or give up.
+// Classify sorts a failed status.
 func Classify(status int) Class {
 	switch {
 	case status == http.StatusTooManyRequests, status >= 500, status == http.StatusConflict,
 		status == http.StatusRequestTimeout:
 		return Retry
+	case status == http.StatusUnauthorized, status == http.StatusForbidden, status >= 300 && status < 400:
+		return Pause
+	case status == http.StatusNotFound:
+		return Missing
 	default:
 		return Permanent
 	}
@@ -250,7 +263,6 @@ func (c *Client) Send(ctx context.Context, spool Spool, update Update) (Result, 
 
 	failure := &Error{Class: Classify(res.StatusCode), Status: res.StatusCode}
 	if res.StatusCode >= 300 && res.StatusCode < 400 {
-		failure.Class = Permanent
 		failure.Message = "redirected to " + res.Header.Get("Location") + "; set spoolbook_url to the final address"
 	}
 
@@ -284,15 +296,14 @@ func parseRetryAfter(v string, now time.Time) time.Duration {
 		return 0
 	}
 
+	var d time.Duration
 	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second
+		d = time.Duration(min(secs, int(MaxRetryAfter/time.Second))) * time.Second
+	} else if at, err := http.ParseTime(v); err == nil && at.After(now) {
+		d = at.Sub(now)
 	}
 
-	if at, err := http.ParseTime(v); err == nil && at.After(now) {
-		return at.Sub(now)
-	}
-
-	return 0
+	return min(d, MaxRetryAfter)
 }
 
 // redact keeps the token out of an error, should a transport ever quote it.

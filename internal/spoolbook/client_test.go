@@ -101,13 +101,13 @@ func TestSendClassifiesFailures(t *testing.T) {
 		{"bad gateway", 502, nil, ``, Retry, "", 0},
 		{"conflict", 409, nil, `{"error":"conflict"}`, Retry, "conflict", 0},
 		{"library invalid", 409, nil, `{"error":"library_invalid"}`, Retry, "library_invalid", 0},
-		{"bad token", 401, nil, `{"error":"unauthorized"}`, Permanent, "unauthorized", 0},
-		{"forbidden", 403, nil, `{"error":"forbidden"}`, Permanent, "forbidden", 0},
-		{"no spool", 404, nil, `{"error":"not_found"}`, Permanent, "not_found", 0},
+		{"bad token", 401, nil, `{"error":"unauthorized"}`, Pause, "unauthorized", 0},
+		{"forbidden", 403, nil, `{"error":"forbidden"}`, Pause, "forbidden", 0},
+		{"no spool", 404, nil, `{"error":"not_found"}`, Missing, "not_found", 0},
 		{"too large", 413, nil, `{"error":"too_large"}`, Permanent, "too_large", 0},
 		{"invalid", 422, nil, `{"error":"invalid"}`, Permanent, "invalid", 0},
 		{"bad request", 400, nil, `{"error":"bad_request"}`, Permanent, "bad_request", 0},
-		{"redirect", 302, map[string]string{"Location": "https://elsewhere.example/"}, ``, Permanent, "", 0},
+		{"redirect", 302, map[string]string{"Location": "https://elsewhere.example/"}, ``, Pause, "", 0},
 	}
 
 	for _, tc := range cases {
@@ -236,6 +236,8 @@ func TestParseRetryAfter(t *testing.T) {
 		"junk":                          0,
 		"Thu, 19 Nov 2026 12:02:00 GMT": 2 * time.Minute,
 		"Thu, 19 Nov 2026 11:00:00 GMT": 0,
+		"86400":                         time.Hour,
+		"Fri, 20 Nov 2026 12:00:00 GMT": time.Hour,
 	}
 
 	for in, want := range cases {
