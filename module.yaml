@@ -17,6 +17,7 @@ contract_major: 1
 require:
   core: ">=0.1.0-beta.1"
   core-bus.subscribe: "*"
+  core-device.jobs: "*"
   core-routes.call: "*"
   core-state.get: "*"
   core-state.put: "*"
@@ -29,7 +30,8 @@ require:
 calls:
   - com.github.aux.prusa3d.materials
 
-# Read the printers' print events and the Materials events, as itself.
+# Read the printers' print events, their current print (device.jobs) and the
+# Materials events, as itself.
 permissions:
   - observe
 

@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -31,10 +32,17 @@ type fakeMaterials struct {
 	readings [][]Tool
 	spools   map[int64]MaterialsSpool
 	calls    int
+	// fail fails the next calls to Tools
+	fail int
 }
 
 func (m *fakeMaterials) Tools(_ context.Context, device string) ([]Tool, error) {
 	m.calls++
+	if m.fail > 0 {
+		m.fail--
+		return nil, errors.New("materials down")
+	}
+
 	if len(m.readings) > 0 {
 		r := m.readings[0]
 		m.readings = m.readings[1:]
@@ -52,6 +60,24 @@ func (m *fakeMaterials) Spool(_ context.Context, n int64) (MaterialsSpool, error
 	}
 
 	return s, nil
+}
+
+// settled is OnJobSettled followed by the settle worker's work, in line.
+func settled(b *Bridge, ctx context.Context, device string, ev JobSettled) error {
+	if err := b.OnJobSettled(ctx, device, ev); err != nil {
+		return err
+	}
+
+	settles, err := b.settles(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, s := range settles {
+		b.Settle(ctx, s)
+	}
+
+	return nil
 }
 
 // newBridge is New with a sleep that moves the test clock.
@@ -149,7 +175,7 @@ func TestToolNumber(t *testing.T) {
 
 	cases := map[string]*int{
 		"0": new(0), "3": new(3), "0.0": new(0), "0.2": new(2), "2.0": new(2),
-		"1.4": nil, "x": nil, "": nil, "64": nil, "-1": nil, "0.x": nil, "0.-1": nil,
+		"1.4": nil, "1.2": nil, "x": nil, "": nil, "64": nil, "-1": nil, "0.x": nil, "0.-1": nil,
 	}
 	for in, want := range cases {
 		got := ToolNumber(in)
@@ -366,7 +392,7 @@ func TestPrints(t *testing.T) {
 			b = newBridge(kv, m, c)
 			m.tools["p1"], m.spools = tc.end, tc.spools
 			ended := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
-			if err := b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: tc.outcome, Ended: ended}); err != nil {
+			if err := settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: tc.outcome, Ended: ended}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -421,7 +447,7 @@ func TestPrintToolNumberAndMMUSlot(t *testing.T) {
 	m.tools["p1"] = []Tool{{ToolID: "0.3", SpoolID: id(1), Remaining: 100}}
 	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1", Path: "/usb/cube.bgcode"})
 	m.tools["p1"] = []Tool{{ToolID: "0.3", SpoolID: id(1), Remaining: 90}}
-	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+	_ = settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
 
 	e := pending(t, b)
 	if len(e) != 1 || e[0].Body.Print.Tool == nil || *e[0].Body.Print.Tool != 3 || e[0].Body.Print.File != "cube.bgcode" {
@@ -434,7 +460,7 @@ func TestSettledWithoutStartRecordsNothing(t *testing.T) {
 
 	b, m, _, _ := setup(t)
 	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 100}}
-	if err := b.OnJobSettled(context.Background(), "p1", JobSettled{JobID: "j1", Outcome: Finished}); err != nil {
+	if err := settled(b, context.Background(), "p1", JobSettled{JobID: "j1", Outcome: Finished}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -453,7 +479,7 @@ func TestStartedTwiceKeepsTheFirstReading(t *testing.T) {
 	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 700}}
 	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
 	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 650}}
-	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+	_ = settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
 
 	e := pending(t, b)
 	if len(e) != 1 || e[0].Body.Print.Grams != 150 {
@@ -470,7 +496,7 @@ func TestPrintSupersedesAQueuedAmount(t *testing.T) {
 	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
 	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
 	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 780}}
-	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+	_ = settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
 
 	e := pending(t, b)
 	if len(e) != 1 || e[0].Body.Print == nil || *e[0].Body.Remaining != 780 {
@@ -588,22 +614,28 @@ func TestSettleWaitsForTheWeightToStop(t *testing.T) {
 
 	reading := func(g float64) []Tool { return []Tool{{ToolID: "0", SpoolID: id(1), Remaining: g}} }
 
+	steps := 1 + int(SettleFor/SettleEvery)
+
 	cases := []struct {
 		name     string
 		readings [][]Tool
+		after    []Tool
 		grams    float64
 		reads    int
 	}{
-		{"steady at once", [][]Tool{reading(780), reading(780)}, 20, 2},
-		{"still counting", [][]Tool{reading(785), reading(781), reading(779), reading(779)}, 21, 4},
-		// never steady: after SettleFor, the last reading
+		// the first read is still the old weight: wait for it to move
+		{"stale, then steady", [][]Tool{reading(800), reading(780), reading(780)}, nil, 20, 3},
+		{"still counting", [][]Tool{reading(785), reading(781), reading(779), reading(779)}, nil, 21, 4},
+		// already moved before the settle: two equal reads aren't enough,
+		// it waits out SettleFor
+		{"already moved", [][]Tool{reading(780)}, reading(780), 20, steps},
 		{"never steady", func() [][]Tool {
 			var r [][]Tool
 			for i := range 20 {
 				r = append(r, reading(790-float64(i)))
 			}
 			return r
-		}(), 22, 1 + int(SettleFor/SettleEvery)},
+		}(), nil, 22, steps},
 	}
 
 	for _, tc := range cases {
@@ -616,7 +648,11 @@ func TestSettleWaitsForTheWeightToStop(t *testing.T) {
 			_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
 
 			m.calls, m.readings = 0, tc.readings
-			if err := b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished}); err != nil {
+			if tc.after != nil {
+				m.tools["p1"] = tc.after
+			}
+
+			if err := settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -662,5 +698,197 @@ func TestNotedRereadsTheLink(t *testing.T) {
 
 	if got, _ := l.Get(ctx, 1); got.Remaining == nil || *got.Remaining != 400 {
 		t.Errorf("link = %+v", got)
+	}
+}
+
+func TestSettleWithoutLinkedToolsDoesNotWait(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(7), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+	m.calls = 0
+	_ = settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+	if m.calls != 0 {
+		t.Errorf("read the tools %d times for a print with no linked spool", m.calls)
+	}
+}
+
+func TestSettleRetriesMaterials(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 790}}
+
+	m.fail = 5
+	_ = settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+
+	e := pending(t, b)
+	if len(e) != 1 || e[0].Body.Print.Grams != 10 {
+		t.Fatalf("queued %+v", e)
+	}
+
+	if s, _ := b.settles(ctx); len(s) != 0 {
+		t.Errorf("settle kept: %+v", s)
+	}
+}
+
+func TestSettleGivesUpAfterADay(t *testing.T) {
+	t.Parallel()
+
+	b, m, c, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+	start := c.now()
+	m.fail = 1 << 30
+	_ = settled(b, ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+
+	if c.now().Sub(start) < GiveUpAfter {
+		t.Errorf("gave up after %v", c.now().Sub(start))
+	}
+
+	if s, _ := b.settles(ctx); len(s) != 0 || len(pending(t, b)) != 0 {
+		t.Errorf("settles %+v", s)
+	}
+}
+
+func TestSettleIsQuickAndHoldsItsSpool(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+	m.calls = 0
+	if err := b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished}); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.calls != 0 {
+		t.Errorf("the event path read Materials %d times", m.calls)
+	}
+
+	// while it settles, the spool's amount left waits for the print
+	_ = b.OnSpool(ctx, SpoolEvent{SpoolID: 1, Remaining: 780})
+	if e := pending(t, b); len(e) != 0 {
+		t.Fatalf("queued %+v", e)
+	}
+}
+
+func TestRunSettlesResumesAfterARestart(t *testing.T) {
+	t.Parallel()
+
+	b, m, c, kv := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+
+	// a new process: the settle record is picked up
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 770}}
+	b = newBridge(kv, m, c)
+	run, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { b.RunSettles(run); close(done) }()
+
+	for range 1000 {
+		if s, _ := b.settles(ctx); len(s) == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stop()
+	<-done
+
+	e := pending(t, b)
+	if len(e) != 1 || e[0].Body.Print.Grams != 30 {
+		t.Fatalf("queued %+v", e)
+	}
+}
+
+type fakeDevices struct{ current, last *DeviceJob }
+
+func (f fakeDevices) Jobs(context.Context, string) (*DeviceJob, *DeviceJob, error) {
+	return f.current, f.last, nil
+}
+
+func TestReconcileWithConnectsRecord(t *testing.T) {
+	t.Parallel()
+
+	ended := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name    string
+		devices fakeDevices
+		// printing: spool 1's updates wait; settled: the print was recorded
+		printing, settled bool
+	}{
+		{"still current", fakeDevices{current: &DeviceJob{ID: "j1"}}, true, false},
+		{"another print now", fakeDevices{current: &DeviceJob{ID: "j9"}}, false, false},
+		{"idle, last is another", fakeDevices{last: &DeviceJob{ID: "j0", Ended: &ended}}, false, false},
+		{"idle, settle lost", fakeDevices{last: &DeviceJob{ID: "j1", Ended: &ended, Outcome: Finished, DisplayName: "Benchy"}}, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b, m, _, _ := setup(t)
+			b.Devices = tc.devices
+			ctx := context.Background()
+			m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+			_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+			if got := b.printing(ctx, 1); got != tc.printing {
+				t.Errorf("printing = %v, want %v", got, tc.printing)
+			}
+
+			settles, _ := b.settles(ctx)
+			if (len(settles) == 1) != tc.settled {
+				t.Fatalf("settles = %+v", settles)
+			}
+
+			if tc.settled {
+				if s := settles[0]; s.Outcome != Finished || s.File != "Benchy" || !s.Ended.Equal(ended) {
+					t.Errorf("settle = %+v", s)
+				}
+			}
+
+			if jobs, _ := b.Jobs(ctx); len(jobs) != map[bool]int{true: 1}[tc.printing && !tc.settled] {
+				t.Errorf("jobs = %+v", jobs)
+			}
+		})
+	}
+}
+
+func TestPrintingCachesTheToolsRead(t *testing.T) {
+	t.Parallel()
+
+	b, m, c, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+	m.calls = 0
+	for range 5 {
+		b.printing(ctx, 1)
+	}
+
+	if m.calls != 1 {
+		t.Errorf("read the tools %d times in 5 s", m.calls)
+	}
+
+	c.advance(cacheFor)
+	b.printing(ctx, 1)
+	if m.calls != 2 {
+		t.Errorf("not read again after %v", cacheFor)
 	}
 }

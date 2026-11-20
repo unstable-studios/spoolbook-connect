@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
-
-	"github.com/unstable-studios/spoolbook-connect/internal/spoolbook"
 )
 
 // Tool is one printer tool as Materials answers it (GET /printers/tools).
@@ -130,10 +128,15 @@ type Bridge struct {
 	Now       func() time.Time
 	// Sleep waits, for the weights to settle. Tests replace it.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Devices reads Connect's own record of each printer's print. Optional:
+	// without it, an open print is only bounded by its spool and JobExpiry.
+	Devices Devices
 	// Wake is poked when something is queued. Optional.
 	Wake func()
 
 	toolsLogged sync.Map
+	cache       readCache
+	settler     settler
 }
 
 // New wires a bridge over one store.
@@ -197,41 +200,6 @@ func (b *Bridge) OnSpool(ctx context.Context, ev SpoolEvent) error {
 	b.wake()
 
 	return b.Links.noted(ctx, link.MaterialsSpool, link.Spool, remaining)
-}
-
-// printing reports whether a spool is on a tool of a print still open: one
-// that started with it there, and whose tool still holds it.
-func (b *Bridge) printing(ctx context.Context, spoolID int64) bool {
-	jobs, err := b.jobs(ctx)
-	if err != nil {
-		b.Log.Warn("could not read the prints in progress", "error", err)
-
-		return true
-	}
-
-	for _, job := range jobs {
-		for _, t := range job.Tools {
-			if t.SpoolID != spoolID {
-				continue
-			}
-
-			tools, err := b.Materials.Tools(ctx, job.DeviceID)
-			if err != nil {
-				// the settle sends the amount if it is still printing
-				b.Log.Warn("could not read the tools", "printer", job.DeviceID, "error", err)
-
-				return true
-			}
-
-			for _, now := range tools {
-				if now.ToolID == t.ToolID && now.SpoolID != nil && *now.SpoolID == spoolID {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
 }
 
 // jobs returns the prints in progress, removing any kept past JobExpiry.
@@ -312,146 +280,6 @@ func (b *Bridge) OnJobStarted(ctx context.Context, deviceID string, ev JobStarte
 	}
 
 	return putJSON(ctx, b.KV, key, job)
-}
-
-// settledTools reads a printer's tools until the job's spools read the same
-// twice in a row, SettleEvery apart, or SettleFor has passed.
-func (b *Bridge) settledTools(ctx context.Context, job Job) ([]Tool, error) {
-	read := func() ([]Tool, string, error) {
-		tools, err := b.Materials.Tools(ctx, job.DeviceID)
-		if err != nil {
-			return nil, "", fmt.Errorf("read the tools of %s: %w", job.DeviceID, err)
-		}
-
-		var sig strings.Builder
-		for _, start := range job.Tools {
-			for _, t := range tools {
-				if t.ToolID == start.ToolID {
-					id := int64(0)
-					if t.SpoolID != nil {
-						id = *t.SpoolID
-					}
-
-					fmt.Fprintf(&sig, "%s=%d:%.1f;", t.ToolID, id, round(t.Remaining))
-				}
-			}
-		}
-
-		return tools, sig.String(), nil
-	}
-
-	tools, last, err := read()
-	if err != nil || len(job.Tools) == 0 {
-		return tools, err
-	}
-
-	for waited := time.Duration(0); waited < SettleFor; waited += SettleEvery {
-		if err := b.Sleep(ctx, SettleEvery); err != nil {
-			return nil, err
-		}
-
-		var now string
-		if tools, now, err = read(); err != nil {
-			return nil, err
-		}
-
-		if now == last {
-			return tools, nil
-		}
-
-		last = now
-	}
-
-	return tools, nil
-}
-
-// OnJobSettled records a finished or failed print on each linked spool it
-// used, with the drop in its amount left as grams.
-func (b *Bridge) OnJobSettled(ctx context.Context, deviceID string, ev JobSettled) error {
-	key := jobKey(deviceID, ev.JobID)
-
-	var job Job
-	if err := getJSON(ctx, b.KV, key, &job); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			b.Log.Info("a print settled that started before this module watched; not recorded",
-				"printer", deviceID, "job", ev.JobID)
-
-			return nil
-		}
-
-		return err
-	}
-
-	tools, err := b.settledTools(ctx, job)
-	if err != nil {
-		return err
-	}
-
-	now := map[string]Tool{}
-	for _, t := range tools {
-		now[t.ToolID] = t
-	}
-
-	record := ev.Outcome == Finished || ev.Outcome == Failed
-	file := fileName(ev.DisplayName, ev.Path)
-	if file == "" {
-		file = job.File
-	}
-
-	ended := ev.Ended
-	if ended.IsZero() {
-		ended = b.Now()
-	}
-
-	started := job.JobStarted
-	if started.IsZero() {
-		started = ev.Started
-	}
-
-	for _, start := range job.Tools {
-		link, err := b.Links.Get(ctx, start.SpoolID)
-		if errors.Is(err, ErrNotFound) {
-			continue
-		}
-
-		if err != nil {
-			return err
-		}
-
-		remaining, grams, err := b.used(ctx, start, now[start.ToolID])
-		if err != nil {
-			return err
-		}
-
-		if record {
-			p := spoolbook.Print{
-				Print: PrintID(deviceID, ev.JobID, started, start.ToolID),
-				Tool:  b.toolNumber(start.ToolID),
-				Date:  ended.Local().Format(time.DateOnly),
-				Grams: grams,
-				File:  file,
-			}
-			if err := b.Outbox.Print(ctx, link.Spool, remaining, p); err != nil {
-				return err
-			}
-		} else if link.Remaining == nil || *link.Remaining != remaining {
-			if err := b.Outbox.Remaining(ctx, link.Spool, remaining, 0); err != nil {
-				return err
-			}
-		}
-
-		if err := b.Links.noted(ctx, link.MaterialsSpool, link.Spool, remaining); err != nil {
-			return err
-		}
-	}
-
-	b.wake()
-
-	if err := b.KV.Delete(ctx, key); err != nil && !errors.Is(err, ErrNotFound) {
-		return err
-	}
-
-	return nil
 }
 
 // used is a spool's amount left now and what the print took off it. A spool
