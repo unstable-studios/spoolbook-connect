@@ -2,6 +2,8 @@ package connect
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,16 +71,23 @@ func (d *Dispatcher) Window(ctx context.Context, w busapi.Window) error {
 			continue
 		}
 
+		// an event without an id is told apart by its bytes
+		key := env.Source + "\x00" + env.ID
+		if env.ID == "" {
+			sum := sha256.Sum256(raw)
+			key = hex.EncodeToString(sum[:])
+		}
+
 		if err := d.handle(ctx, env); err != nil {
-			d.attempts[env.ID]++
-			if d.attempts[env.ID] < MaxAttempts {
+			d.attempts[key]++
+			if d.attempts[key] < MaxAttempts {
 				return fmt.Errorf("%s %s: %w", env.Type, env.ID, err)
 			}
 
 			d.Log.Error("an event kept failing; skipped", "type", env.Type, "id", env.ID, "error", err)
 		}
 
-		delete(d.attempts, env.ID)
+		delete(d.attempts, key)
 	}
 
 	if w.Cursor != "" {

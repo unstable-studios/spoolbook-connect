@@ -19,6 +19,7 @@
 <body>
 <h1>spoolbook links</h1>
 <p class="muted">Sends to {{.Host}}. {{if .Pending}}{{.Pending}} update(s) waiting.{{end}}</p>
+{{if .Paused}}<p class="error" role="alert">spoolbook refused this module's setup ({{.Paused.Status}}): {{.Paused.Error}}. Updates wait. Fix the token, library or address in Settings.</p>{{end}}
 {{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
 {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
 <table>
@@ -38,11 +39,13 @@
         <form method="post" action="page">
           <code>{{.Link.Vendor}}/{{.Link.Filament}}/{{.Link.Spool}}</code>
           <input type="hidden" name="materials_spool" value="{{.ID}}">
+          <input type="hidden" name="token" value="{{$.Token}}">
           <button name="action" value="unlink">Unlink</button>
         </form>
         {{else}}
         <form method="post" action="page">
           <input type="hidden" name="materials_spool" value="{{.ID}}">
+          <input type="hidden" name="token" value="{{$.Token}}">
           <input type="text" name="spoolbook" aria-label="spoolbook spool for #{{.ID}}" placeholder="vendor/filament/spool or the spool's address">
           <button name="action" value="link">Link</button>
         </form>

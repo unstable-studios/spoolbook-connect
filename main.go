@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/prusa3d/prusa-connect/sdk/busapi"
@@ -51,7 +52,7 @@ func main() {
 }
 
 func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// stderr goes to the host's log, which stamps the time; stdout is the wire
@@ -99,7 +100,7 @@ func run() error {
 	}
 
 	routes := &connect.Routes{
-		Links: b.Links, Outbox: b.Outbox, Jobs: b.Jobs,
+		Links: b.Links, Outbox: b.Outbox, Jobs: b.Jobs, KV: kv,
 		Spools: spoolsFor{materials},
 	}
 
@@ -121,7 +122,7 @@ func run() error {
 
 		// plugin.configure comes once, before any other call
 		once.Do(func() {
-			routes.Host = client.Host()
+			routes.SetHost(client.Host())
 			log.Info("sending to spoolbook", "host", client.Host(), "library", held.Library)
 
 			go follow(ctx, conn, &connect.Dispatcher{Handler: b, KV: kv, Log: log}, log)
@@ -171,9 +172,18 @@ func follow(ctx context.Context, conn *wirerpc.Conn, d *connect.Dispatcher, log 
 func deliver(ctx context.Context, outbox *bridge.Outbox, client *spoolbook.Client, wake <-chan struct{}, log *slog.Logger) {
 	// the store answers once the host marks the module ready, just after
 	// plugin.configure
-	select {
-	case <-time.After(5 * time.Second):
-	case <-ctx.Done():
+	for wait := 100 * time.Millisecond; outbox.Ready(ctx) != nil; wait = min(wait*2, 10*time.Second) {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	// settings arrive once per start, and a change restarts the module: try
+	// again whatever paused the queue before
+	if err := outbox.Resume(ctx); err != nil {
+		log.Warn("could not lift the pause", "error", err)
 	}
 
 	for ctx.Err() == nil {

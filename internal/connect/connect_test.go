@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prusa3d/prusa-connect/sdk/busapi"
 	"github.com/prusa3d/prusa-connect/sdk/event"
@@ -232,14 +234,18 @@ func (l listSpools) Spools(context.Context, string) ([]bridge.MaterialsSpool, er
 
 func newRoutes() (*Routes, http.Handler) {
 	kv := bridge.NewMemKV()
-	b := bridge.New(kv, nil, quiet, nil)
+	b := bridge.New(kv, nil, quiet, time.Now)
 	rt := &Routes{
-		Links: b.Links, Outbox: b.Outbox, Jobs: b.Jobs, Host: "spoolbook.example",
+		Links: b.Links, Outbox: b.Outbox, Jobs: b.Jobs, KV: kv,
 		Spools: listSpools{{ID: 1, UUID: "u1", BrandName: "Prusament", MaterialName: "PLA Galaxy Black", ColorRGBA: "#000000ff", Remaining: 812}, {ID: 2, UUID: "u2"}},
 	}
 
+	rt.SetHost("spoolbook.example")
+
 	return rt, rt.Handler()
 }
+
+var tokenField = regexp.MustCompile(`name="token" value="([0-9a-f]+)"`)
 
 func do(h http.Handler, method, target, ctype, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
@@ -309,7 +315,32 @@ func TestPage(t *testing.T) {
 		t.Fatalf("page = %d %s", w.Code, w.Body)
 	}
 
-	w = do(h, http.MethodPost, "/page", form, "action=link&materials_spool=1&spoolbook="+url.QueryEscape("https://spoolbook.example/app/spool/prusament/pla/a1?lib=x"))
+	if w.Header().Get("X-Frame-Options") != "DENY" || !strings.Contains(w.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Errorf("headers = %v", w.Header())
+	}
+
+	m := tokenField.FindStringSubmatch(w.Body.String())
+	if m == nil {
+		t.Fatal("the page's forms carry no token")
+	}
+
+	tok := "&token=" + m[1]
+
+	// another site's form: no token, or a wrong one
+	for _, body := range []string{
+		"action=link&materials_spool=1&spoolbook=a/b/c",
+		"action=link&materials_spool=1&spoolbook=a/b/c&token=00",
+	} {
+		if w := do(h, http.MethodPost, "/page", form, body); w.Code != http.StatusForbidden {
+			t.Errorf("%s = %d", body, w.Code)
+		}
+	}
+
+	if _, err := rt.Links.Get(context.Background(), 1); err == nil {
+		t.Fatal("linked without a token")
+	}
+
+	w = do(h, http.MethodPost, "/page", form, "action=link&materials_spool=1&spoolbook="+url.QueryEscape("https://spoolbook.example/app/spool/prusament/pla/a1?lib=x")+tok)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "Linked.") || !strings.Contains(w.Body.String(), "prusament/pla/a1") {
 		t.Fatalf("link = %d %s", w.Code, w.Body)
 	}
@@ -323,12 +354,12 @@ func TestPage(t *testing.T) {
 		"action=link&materials_spool=x&spoolbook=a/b/c",
 		"action=other&materials_spool=1",
 	} {
-		if w := do(h, http.MethodPost, "/page", form, body); w.Code != 400 {
+		if w := do(h, http.MethodPost, "/page", form, body+tok); w.Code != 400 {
 			t.Errorf("%s = %d", body, w.Code)
 		}
 	}
 
-	w = do(h, http.MethodPost, "/page", form, "action=unlink&materials_spool=1")
+	w = do(h, http.MethodPost, "/page", form, "action=unlink&materials_spool=1"+tok)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "Unlinked.") {
 		t.Fatalf("unlink = %d", w.Code)
 	}
@@ -364,4 +395,29 @@ func TestParseSpoolbookRef(t *testing.T) {
 func cursor(d *Dispatcher) string {
 	c, _ := d.Cursor(context.Background())
 	return c
+}
+
+func TestStatusShowsAPause(t *testing.T) {
+	t.Parallel()
+
+	rt, h := newRoutes()
+	ctx := context.Background()
+	_ = rt.Outbox.Remaining(ctx, spoolbook.Spool{Vendor: "v", Filament: "f", Spool: "s"}, 1, 0)
+	_, _ = rt.Outbox.Flush(ctx, refuser{})
+
+	var st Status
+	_ = json.Unmarshal(do(h, http.MethodGet, "/status", "", "").Body.Bytes(), &st)
+	if st.Paused == nil || st.Paused.Status != 401 || len(st.Pending) != 1 {
+		t.Fatalf("status = %+v", st)
+	}
+
+	if w := do(h, http.MethodGet, "/page", "", ""); !strings.Contains(w.Body.String(), "refused this module") {
+		t.Error("the page doesn't say so")
+	}
+}
+
+type refuser struct{}
+
+func (refuser) Send(context.Context, spoolbook.Spool, spoolbook.Update) (spoolbook.Result, error) {
+	return spoolbook.Result{}, &spoolbook.Error{Class: spoolbook.Pause, Status: 401, Code: "unauthorized"}
 }
