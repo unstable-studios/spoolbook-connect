@@ -1,7 +1,7 @@
 name: spoolbook
 kind: sink
 version: 0.1.1
-license: MIT
+license: OCL v1.1 + Micro v1 + NoSaaS v1 + SWAtt v1
 title: spoolbook
 summary: >-
   Sends what Materials' spools have left, and the prints that used them, to a
