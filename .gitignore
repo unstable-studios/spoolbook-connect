@@ -2,3 +2,4 @@
 /dist/
 /bin/
 *.tar.gz
+/.core/
