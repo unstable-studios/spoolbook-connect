@@ -19,10 +19,25 @@ your spoolbook library:
   twice. A print that took nothing measurable, or whose spool was swapped
   mid-print, is recorded with 0 g. A cancelled print records no print; the
   spool's amount left is still sent.
+- **A print that never settles** (Connect lost track of it, or the module was
+  down past Connect's event buffer) is forgotten when the printer starts
+  another print, when its spool leaves the tool, or after 48 hours, so it
+  can't hold that spool's updates back.
 
 Updates wait in the module's store until spoolbook takes them, so a restart
-or a network outage loses nothing. Each print has a fixed id (SHA-256 of the
-printer, job and tool), so a retry never counts a print twice.
+or a network outage doesn't lose them. Some are dropped on purpose (see
+Delivery). Each print has a fixed id (SHA-256 of the printer, job, the job's
+start time and tool), so a retry or a replayed event never counts a print
+twice, and a job number a printer reuses after a reset is a new print.
+
+**Grams and timing.** At the end of a print, the module reads the tools
+every 10 s until two reads agree, for up to 2 minutes, before working out the
+grams: Materials may still be counting the last of the print. What is left of
+that race: filament Materials counts more than 2 minutes after the print
+settled, or a purge or unload in that window, lands in the next amount left
+rather than in the print's grams. Either way spoolbook's amount left ends up
+right; only how the grams are split between the print and the spool's other
+use can be off.
 
 Design: [spoolbook's spike](https://github.com/unstable-studios/spoolbook/blob/main/docs/spikes/prusa-connect-local.md),
 issue unstable-studios/spoolbook#239.
@@ -98,11 +113,22 @@ Building it yourself: `sh scripts/release.sh` writes `release/` and the
 
 ## Delivery
 
-- Retries with backoff (30 s doubling to 1 h) on 429 (honoring
-  `Retry-After`), 5xx, 409 (a conflict, or a library with problems to fix in
-  the app) and network errors.
-- Gives up on 400, 401, 403, 404, 413 and 422, logging each once: the token
-  is wrong or revoked, the spool doesn't exist, or the update doesn't fit.
+- Retries with backoff (30 s doubling to 1 h) on 5xx, 409 (a conflict, or a
+  library with problems to fix in the app) and network errors.
+- On 429, nothing goes until the `Retry-After` (capped at 1 h): the limit is
+  the token's, not the spool's.
+- On 401 (the token was revoked or rotated, or its maker is no longer an
+  editor), 403 (a library limit or role) or a redirect (`spoolbook_url`
+  moved), the whole queue pauses: 15 minutes, doubling to 6 hours. Nothing
+  is dropped. `GET /status` and the links page show why. It resumes when a
+  send works, or when the module starts again (changing its settings
+  restarts it).
+- On 404 (no such spool, perhaps linked before it was made in spoolbook),
+  that spool's updates are kept and tried every 1 to 6 hours. After 7 days
+  they are dropped and logged.
+- Gives up on 400, 413 and 422, logging each once: the update doesn't fit.
+- A queued record that can't be read is moved aside to `bad/` in the store
+  and logged; the rest still goes.
 - A spool's updates go in order: a newer amount left waits behind an older
   print that hasn't gone yet.
 - Requests time out after 30 s, never follow a redirect, and the token never
@@ -134,14 +160,20 @@ Not verified yet:
   The drop in `remaining_weight_g` on a real printer (odometer or NFC tag)
   is the design, not yet seen.
 - **The links page in a browser.** It's a plain HTML page with forms served
-  from the module's own route. The host forwards `Content-Type`, but whether
-  the Connect web app's session, CSRF rules or content security policy allow
-  a form post to a module route hasn't been tried. The JSON routes work with
-  a Connect token. A proper settings tab (`ui.contributes.settings`) needs a
-  browser bundle built against `@prusa/connect-ui`, a follow-up.
+  from the module's own route. Whether Connect's web session reaches a module
+  route from a browser (its host auth) hasn't been tried. The JSON routes
+  work with a Connect token. Each form carries a token bound to the person
+  Connect says is asking (an HMAC with a key kept in the store), because
+  Connect passes a module no cookie or `Sec-Fetch-Site` header to check. The
+  page sends `X-Frame-Options: DENY` and a strict CSP, but Connect's docs say
+  the host keeps its own security headers and drops a module's, so those may
+  never reach the browser. A proper settings tab (`ui.contributes.settings`)
+  needs a browser bundle built against `@prusa/connect-ui`, a follow-up.
 - **Egress from an option.** `egress: option: spoolbook_url` is the declared
   form and parses; whether Connect enforces it at run time isn't known.
-- **MMU slots.** A tool id like `0.2` is sent to spoolbook as tool 2.
+- **Tool numbers.** As PrusaSlicer numbers filaments: `e` or `e.0` is tool
+  e, `0.s` (an MMU on the one extruder) is tool s. Anything else (an MMU on
+  a later tool) is sent without a tool number, logged once.
 - **Real spoolbook.** Tested against spoolbook's handler code and a stand-in,
   not yet against spoolbook.unstablestudios.com.
 - **Marketplace.** Not published there; Connect's license terms (OCL with
