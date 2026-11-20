@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/unstable-studios/spoolbook-connect/internal/spoolbook"
 )
@@ -24,8 +25,12 @@ const linkPrefix = "link/"
 
 func linkKey(id int64) string { return linkPrefix + strconv.FormatInt(id, 10) }
 
-// Links keeps links in the store, one record each.
-type Links struct{ kv KV }
+// Links keeps links in the store, one record each. The lock keeps a
+// read-then-write (noted) from undoing a Put or Delete made meanwhile.
+type Links struct {
+	kv KV
+	mu sync.Mutex
+}
 
 // NewLinks returns the links in kv.
 func NewLinks(kv KV) *Links { return &Links{kv: kv} }
@@ -51,18 +56,41 @@ func (l *Links) Put(ctx context.Context, link Link) error {
 
 	link.Remaining = nil
 
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	return putJSON(ctx, l.kv, linkKey(link.MaterialsSpool), link)
 }
 
-// noted records what was last queued for a link.
-func (l *Links) noted(ctx context.Context, link Link, remaining float64) error {
+// noted records what was last queued for a link. It reads the link again, and
+// writes nothing if it was removed or now names another spoolbook spool.
+func (l *Links) noted(ctx context.Context, id int64, target spoolbook.Spool, remaining float64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	link, err := l.Get(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if link.Spool != target {
+		return nil
+	}
+
 	link.Remaining = &remaining
 
-	return putJSON(ctx, l.kv, linkKey(link.MaterialsSpool), link)
+	return putJSON(ctx, l.kv, linkKey(id), link)
 }
 
 // Delete removes a link, and ErrNotFound for none.
 func (l *Links) Delete(ctx context.Context, id int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	return l.kv.Delete(ctx, linkKey(id))
 }
 

@@ -24,13 +24,24 @@ func linkTo(spool string) spoolbook.Spool {
 	return spoolbook.Spool{Vendor: "prusament", Filament: "pla", Spool: spool}
 }
 
-// fakeMaterials answers tools per printer and spools by id.
+// fakeMaterials answers tools per printer and spools by id. readings, when
+// set, are answered first, one per call, before tools.
 type fakeMaterials struct {
-	tools  map[string][]Tool
-	spools map[int64]MaterialsSpool
+	tools    map[string][]Tool
+	readings [][]Tool
+	spools   map[int64]MaterialsSpool
+	calls    int
 }
 
 func (m *fakeMaterials) Tools(_ context.Context, device string) ([]Tool, error) {
+	m.calls++
+	if len(m.readings) > 0 {
+		r := m.readings[0]
+		m.readings = m.readings[1:]
+
+		return r, nil
+	}
+
 	return m.tools[device], nil
 }
 
@@ -43,13 +54,24 @@ func (m *fakeMaterials) Spool(_ context.Context, n int64) (MaterialsSpool, error
 	return s, nil
 }
 
+// newBridge is New with a sleep that moves the test clock.
+func newBridge(kv KV, m Materials, c *clock) *Bridge {
+	b := New(kv, m, quiet, c.now)
+	b.Sleep = func(_ context.Context, d time.Duration) error {
+		c.advance(d)
+		return nil
+	}
+
+	return b
+}
+
 func setup(t *testing.T) (*Bridge, *fakeMaterials, *clock, *MemKV) {
 	t.Helper()
 
 	kv := NewMemKV()
 	c := newClock()
 	m := &fakeMaterials{tools: map[string][]Tool{}, spools: map[int64]MaterialsSpool{}}
-	b := New(kv, m, quiet, c.now)
+	b := newBridge(kv, m, c)
 
 	for n, s := range map[int64]string{1: "s1", 2: "s2"} {
 		if err := b.Links.Put(context.Background(), Link{MaterialsSpool: n, Spool: linkTo(s)}); err != nil {
@@ -74,28 +96,32 @@ func pending(t *testing.T, b *Bridge) []Entry {
 func TestPrintID(t *testing.T) {
 	t.Parallel()
 
-	a := PrintID("printer-1", "job-1", "0")
+	at := time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
+	a := PrintID("printer-1", "job-1", at, "0")
 	if len(a) != 64 || !spoolbook.PrintIDFormat.MatchString(a) {
 		t.Fatalf("PrintID = %q, not 64 hex", a)
 	}
 
-	if a != PrintID("printer-1", "job-1", "0") {
-		t.Error("not stable")
+	if a != PrintID("printer-1", "job-1", at.In(time.FixedZone("CET", 3600)), "0") {
+		t.Error("not stable across time zones")
 	}
 
 	for _, other := range []string{
-		PrintID("printer-1", "job-1", "1"),
-		PrintID("printer-2", "job-1", "0"),
-		PrintID("printer-1", "job-2", "0"),
-		PrintID("printer-1j", "ob-1", "0"),
+		PrintID("printer-1", "job-1", at, "1"),
+		PrintID("printer-2", "job-1", at, "0"),
+		PrintID("printer-1", "job-2", at, "0"),
+		PrintID("printer-1j", "ob-1", at, "0"),
+		// the printer reused its job id after a reset
+		PrintID("printer-1", "job-1", at.Add(time.Hour), "0"),
 	} {
 		if other == a {
 			t.Errorf("collision: %s", other)
 		}
 	}
 
-	// sha256 of "printer-1", NUL, "job-1", NUL, "0", checked with Python's hashlib
-	if want := "a3a4165b78a706d46b9178775c7fc3efe59075b675893a948708a72ff143267e"; a != want {
+	// sha256 of "printer-1", NUL, "job-1", NUL, "2026-11-19T10:00:00Z", NUL,
+	// "0", checked with Python's hashlib
+	if want := "3d32348b017d89267a8b35f9ce66642304f1b4422e3d43af130e6b860fa15221"; a != want {
 		t.Errorf("PrintID = %s, want %s", a, want)
 	}
 }
@@ -121,7 +147,10 @@ func TestGrams(t *testing.T) {
 func TestToolNumber(t *testing.T) {
 	t.Parallel()
 
-	cases := map[string]*int{"0": new(0), "3": new(3), "0.2": new(2), "1.4": new(4), "x": nil, "": nil, "64": nil, "-1": nil}
+	cases := map[string]*int{
+		"0": new(0), "3": new(3), "0.0": new(0), "0.2": new(2), "2.0": new(2),
+		"1.4": nil, "x": nil, "": nil, "64": nil, "-1": nil, "0.x": nil, "0.-1": nil,
+	}
 	for in, want := range cases {
 		got := ToolNumber(in)
 		if (got == nil) != (want == nil) || (got != nil && *got != *want) {
@@ -220,6 +249,8 @@ func equal(a, b []float64) bool {
 func TestPrints(t *testing.T) {
 	t.Parallel()
 
+	started := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
+
 	type queued struct {
 		spool     string
 		remaining float64
@@ -317,7 +348,7 @@ func TestPrints(t *testing.T) {
 			ctx := context.Background()
 
 			m.tools["p1"] = tc.start
-			if err := b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1", DisplayName: "Benchy"}); err != nil {
+			if err := b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1", DisplayName: "Benchy", Started: started}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -332,7 +363,7 @@ func TestPrints(t *testing.T) {
 
 			// a restart mid-print: a new bridge over the same store
 			c.advance(time.Hour)
-			b = New(kv, m, quiet, c.now)
+			b = newBridge(kv, m, c)
 			m.tools["p1"], m.spools = tc.end, tc.spools
 			ended := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
 			if err := b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: tc.outcome, Ended: ended}); err != nil {
@@ -345,7 +376,7 @@ func TestPrints(t *testing.T) {
 				if p := e.Body.Print; p != nil {
 					q.print, q.grams = true, p.Grams
 					q.tool = map[string]string{
-						PrintID("p1", "j1", "0"): "0", PrintID("p1", "j1", "0.0"): "0.0", PrintID("p1", "j1", "0.3"): "0.3",
+						PrintID("p1", "j1", started, "0"): "0", PrintID("p1", "j1", started, "0.0"): "0.0", PrintID("p1", "j1", started, "0.3"): "0.3",
 					}[p.Print]
 					if p.File != "Benchy" || p.Date != ended.Local().Format(time.DateOnly) {
 						t.Errorf("print = %+v", p)
@@ -488,5 +519,148 @@ func TestLinks(t *testing.T) {
 		if _, err := ParseSpoolID(s); err == nil {
 			t.Errorf("ParseSpoolID(%q) accepted", s)
 		}
+	}
+}
+
+// An open print that never settles must not hold its spool's updates for good.
+func TestStaleJobsDoNotBlockASpool(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		// then runs after job j1 started with spool 1 on tool 0
+		then func(b *Bridge, m *fakeMaterials, c *clock)
+	}{
+		{"expired after 48 h", func(_ *Bridge, _ *fakeMaterials, c *clock) { c.advance(JobExpiry + time.Minute) }},
+		{"the printer started another print", func(b *Bridge, m *fakeMaterials, _ *clock) {
+			m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(2), Remaining: 300}}
+			_ = b.OnJobStarted(context.Background(), "p1", JobStarted{JobID: "j2"})
+		}},
+		{"the spool left the tool", func(_ *Bridge, m *fakeMaterials, _ *clock) {
+			m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(2), Remaining: 300}}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b, m, c, _ := setup(t)
+			ctx := context.Background()
+			m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+			if err := b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"}); err != nil {
+				t.Fatal(err)
+			}
+
+			tc.then(b, m, c)
+
+			if err := b.OnSpool(ctx, SpoolEvent{SpoolID: 1, Remaining: 650}); err != nil {
+				t.Fatal(err)
+			}
+
+			e := pending(t, b)
+			if len(e) != 1 || e[0].Spool != linkTo("s1") || *e[0].Body.Remaining != 650 {
+				t.Fatalf("queued %+v", e)
+			}
+		})
+	}
+}
+
+func TestOlderJobsOfAPrinterGoOnItsNextStart(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	m.tools["p2"] = []Tool{{ToolID: "0", SpoolID: id(2), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+	_ = b.OnJobStarted(ctx, "p2", JobStarted{JobID: "k1"})
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j2"})
+
+	jobs, _ := b.Jobs(ctx)
+	if len(jobs) != 2 || jobs[0].JobID != "j2" || jobs[1].JobID != "k1" {
+		t.Fatalf("jobs = %+v", jobs)
+	}
+}
+
+func TestSettleWaitsForTheWeightToStop(t *testing.T) {
+	t.Parallel()
+
+	reading := func(g float64) []Tool { return []Tool{{ToolID: "0", SpoolID: id(1), Remaining: g}} }
+
+	cases := []struct {
+		name     string
+		readings [][]Tool
+		grams    float64
+		reads    int
+	}{
+		{"steady at once", [][]Tool{reading(780), reading(780)}, 20, 2},
+		{"still counting", [][]Tool{reading(785), reading(781), reading(779), reading(779)}, 21, 4},
+		// never steady: after SettleFor, the last reading
+		{"never steady", func() [][]Tool {
+			var r [][]Tool
+			for i := range 20 {
+				r = append(r, reading(790-float64(i)))
+			}
+			return r
+		}(), 22, 1 + int(SettleFor/SettleEvery)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b, m, _, _ := setup(t)
+			ctx := context.Background()
+			m.tools["p1"] = reading(800)
+			_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+			m.calls, m.readings = 0, tc.readings
+			if err := b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished}); err != nil {
+				t.Fatal(err)
+			}
+
+			e := pending(t, b)
+			if len(e) != 1 || e[0].Body.Print.Grams != tc.grams || m.calls != tc.reads {
+				t.Fatalf("queued %+v after %d reads; want %v g after %d", e, m.calls, tc.grams, tc.reads)
+			}
+		})
+	}
+}
+
+func TestNotedRereadsTheLink(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	l := NewLinks(NewMemKV())
+	_ = l.Put(ctx, Link{MaterialsSpool: 1, Spool: linkTo("s1")})
+	_ = l.Put(ctx, Link{MaterialsSpool: 2, Spool: linkTo("s2")})
+
+	// relinked to another spoolbook spool meanwhile: the new link stays fresh
+	_ = l.Put(ctx, Link{MaterialsSpool: 1, Spool: linkTo("other")})
+	if err := l.noted(ctx, 1, linkTo("s1"), 500); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, _ := l.Get(ctx, 1); got.Spool != linkTo("other") || got.Remaining != nil {
+		t.Errorf("link = %+v", got)
+	}
+
+	// unlinked meanwhile: not written back
+	_ = l.Delete(ctx, 2)
+	if err := l.noted(ctx, 2, linkTo("s2"), 500); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := l.Get(ctx, 2); err != ErrNotFound {
+		t.Errorf("an unlinked spool came back: %v", err)
+	}
+
+	if err := l.noted(ctx, 1, linkTo("other"), 400); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, _ := l.Get(ctx, 1); got.Remaining == nil || *got.Remaining != 400 {
+		t.Errorf("link = %+v", got)
 	}
 }
