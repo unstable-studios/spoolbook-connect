@@ -99,10 +99,10 @@ Building it yourself: `sh scripts/release.sh` writes `release/` and the
 
 ## Set up
 
-1. **Make a token in spoolbook.** Open Manage libraries, pick the library,
-   then Tokens. Name it (for example "Prusa Connect") and copy it: it is
-   shown once. The address shown there,
-   `…/api/libraries/<library>/spools/…`, holds the library id.
+1. **Make a token in spoolbook.** Open Manage libraries and pick the
+   library. Under API tokens, name it (for example "Prusa Connect") and
+   copy it: it is shown once. Set up Prusa Connect, in the same card, has
+   the library id and spoolbook's address to copy.
 2. **Set the module's options** under Settings, Extensions, spoolbook,
    Settings (or in the instance's `config:` block):
 
