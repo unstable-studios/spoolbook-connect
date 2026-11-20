@@ -37,10 +37,19 @@ twice, and a job number a printer reuses after a reset is a new print.
 **Grams and timing.** A settled print is handed to a worker, so the event
 stream never waits on it, and it is kept in the store until its updates are
 queued (a restart picks it up again). The worker reads the tools every 10 s
-until the weight has moved since the first read and two reads agree, or 2
-minutes have passed: Materials may still be counting the last of the print.
-If Materials doesn't answer, it retries with backoff for up to 24 hours, then
-drops the print and logs it. What is left of
+until the weights have settled, because Materials may still be counting the
+last of the print. A read counts as settled at once when it matches the
+amount Materials' own spool event reported after the print ended. Otherwise
+the weight has to move since the first read and then read the same twice,
+or 2 minutes have to pass. Materials reports once per whole gram, so a print
+that took under a gram waits the 2 minutes. If Materials doesn't answer, it
+retries with backoff for up to 24 hours, then drops the print and logs it.
+Once a print is settled, each linked spool is read once more, and an amount
+left that was held back while it settled goes out.
+
+A settle stuck in that backoff reads the weights only once Materials
+answers. If the printer has started another print by then, the grams can
+include some of that print's filament. The amount left is still right. What is left of
 that race: filament Materials counts more than 2 minutes after the print
 settled, or a purge or unload in that window, lands in the next amount left
 rather than in the print's grams. Either way spoolbook's amount left ends up
@@ -75,6 +84,9 @@ The install prints what the module asks for. Read it before you run it with
 
 - `observe` (as the viewer role on the organization) to follow the printers'
   print events, read each printer's current print, and the Materials events.
+  An open print counts as Connect's print only when both its job id and its
+  start time match, so a job id used again can't be taken for an older
+  print.
 - Calls to Materials' routes (`GET /printers/tools`, `GET /spools`).
 - Connections to the host in `spoolbook_url` only.
 
@@ -178,7 +190,12 @@ Not verified yet:
   Connect passes a module no cookie, `Sec-Fetch-Site` or custom header to
   check (`routesapi` forwards an allow-list). `PUT` and `DELETE` on `/links`
   take the same token as `?token=` (from `GET /token`), and `PUT` takes only
-  `Content-Type: application/json`. The
+  `Content-Type: application/json`. A token carries its key's epoch. The key
+  is replaced every 30 days, and the one before it is still accepted for a
+  day after. A request Connect hands over with no signed-in person is
+  refused ("Sign in to Connect"), rather than sharing one token. The page and
+  link routes send `Cache-Control: no-store` and `Referrer-Policy:
+  no-referrer`. Connect only forwards `Cache-Control`. The
   page sends `X-Frame-Options: DENY` and a strict CSP, but Connect's docs say
   the host keeps its own security headers and drops a module's, so those may
   never reach the browser. A proper settings tab (`ui.contributes.settings`)
