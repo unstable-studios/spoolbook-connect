@@ -52,16 +52,23 @@ func main() {
 	}
 	s, b := do("POST", mat+"/custom-materials", map[string]any{"name": "Test PLA", "brand_name": "Prusament", "class": "FFF", "type": "PLA", "color_rgba": "#ff0000ff", "density": 1.24, "diameter_um": 1750})
 	fmt.Println("custom material", s, string(b))
-	var m struct{ UUID string `json:"uuid"` }
+	var m struct {
+		UUID string `json:"uuid"`
+	}
 	_ = json.Unmarshal(b, &m)
 	s, b = do("POST", mat+"/spools", map[string]any{"material_uuid": m.UUID, "remaining_weight_g": 1000, "full_weight_g": 1000, "quantity": 1})
 	fmt.Println("spool", s, string(b))
-	var added struct{ IDs []int64 `json:"ids"` }
+	var added struct {
+		IDs []int64 `json:"ids"`
+	}
 	_ = json.Unmarshal(b, &added)
 	s, b = do("GET", mat+"/printers", nil)
 	fmt.Println("printers", s, string(b)[:min(len(b), 600)])
 	var printers struct {
-		Printers []struct{ ID string `json:"id"`; DeviceID string `json:"device_id"` } `json:"printers"`
+		Printers []struct {
+			ID       string `json:"id"`
+			DeviceID string `json:"device_id"`
+		} `json:"printers"`
 	}
 	_ = json.Unmarshal(b, &printers)
 	dev := ""
