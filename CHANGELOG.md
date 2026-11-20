@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/unstable-studios/spoolbook-connect/compare/v0.2.0...v0.2.1) (2026-11-20)
+
+
+### Documentation
+
+* point the setup at spoolbook's API tokens card ([#10](https://github.com/unstable-studios/spoolbook-connect/issues/10)) ([33f529e](https://github.com/unstable-studios/spoolbook-connect/commit/33f529ec9f4de7f80b34c707682571d644273dd0))
+
+
+### Miscellaneous
+
+* configure Renovate ([3e9e9a7](https://github.com/unstable-studios/spoolbook-connect/commit/3e9e9a7efa15c8457882fe3663ff85362fc5aa4a))
+
 ## [0.2.0](https://github.com/unstable-studios/spoolbook-connect/compare/v0.1.1...v0.2.0) (2026-11-20)
 
 
