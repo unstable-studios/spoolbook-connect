@@ -1,6 +1,6 @@
 name: spoolbook
 kind: sink
-version: 0.1.1
+version: 0.2.0
 license: OCL v1.1 + Micro v1 + NoSaaS v1 + SWAtt v1
 title: spoolbook
 summary: >-
