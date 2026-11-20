@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spoolbook links</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 16px; max-width: 960px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; vertical-align: middle; }
+  form { display: flex; gap: 6px; margin: 0; }
+  input[type=text] { flex: 1; min-width: 12em; }
+  .swatch { display: inline-block; width: 1em; height: 1em; border-radius: 50%; border: 1px solid #999; vertical-align: middle; }
+  .notice { color: #166534; }
+  .error { color: #b91c1c; }
+  .muted { color: #666; }
+</style>
+</head>
+<body>
+<h1>spoolbook links</h1>
+<p class="muted">Sends to {{.Host}}. {{if .Pending}}{{.Pending}} update(s) waiting.{{end}}</p>
+{{if .Paused}}<p class="error" role="alert">spoolbook refused this module's setup ({{.Paused.Status}}): {{.Paused.Error}}. Updates wait. Fix the token, library or address in Settings.</p>{{end}}
+{{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
+{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+<table>
+  <thead>
+    <tr><th>Materials spool</th><th>Left</th><th>spoolbook spool</th></tr>
+  </thead>
+  <tbody>
+  {{range .Rows}}
+    <tr>
+      <td>
+        {{if .ColorRGBA}}<span class="swatch" style="background: {{.ColorRGBA}}"></span>{{end}}
+        #{{.ID}} {{.BrandName}} {{.MaterialName}}{{if .Archived}} <span class="muted">(archived)</span>{{end}}
+      </td>
+      <td>{{if .UUID}}{{printf "%.0f" .Remaining}} g{{end}}</td>
+      <td>
+        {{if .Link}}
+        <form method="post" action="page">
+          <code>{{.Link.Vendor}}/{{.Link.Filament}}/{{.Link.Spool}}</code>
+          <input type="hidden" name="materials_spool" value="{{.ID}}">
+          <input type="hidden" name="token" value="{{$.Token}}">
+          <button name="action" value="unlink">Unlink</button>
+        </form>
+        {{else}}
+        <form method="post" action="page">
+          <input type="hidden" name="materials_spool" value="{{.ID}}">
+          <input type="hidden" name="token" value="{{$.Token}}">
+          <input type="text" name="spoolbook" aria-label="spoolbook spool for #{{.ID}}" placeholder="vendor/filament/spool or the spool's address">
+          <button name="action" value="link">Link</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+  {{else}}
+    <tr><td colspan="3" class="muted">No spools in Materials.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+</body>
+</html>

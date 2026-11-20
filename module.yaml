@@ -1,0 +1,62 @@
+# spoolbook-connect: keeps spoolbook's spools in step with the Materials
+# extension. The host derives the namespace from the module path installed,
+# github.com/unstable-studios/spoolbook-connect, so it is
+# com.github.aux.unstable-studios.spoolbook-connect.
+
+name: spoolbook
+kind: sink
+version: 0.1.0 # x-release-please-version
+license: MIT
+title: spoolbook
+summary: Sends what Materials' spools have left, and the prints that used them, to a spoolbook library.
+codeowner: Unstable Studios
+issue_tracker: https://github.com/unstable-studios/spoolbook-connect/issues
+lifecycle: experimental
+contract_major: 1
+
+require:
+  core: ">=0.1.0-beta.1"
+  core-bus.subscribe: "*"
+  core-device.jobs: "*"
+  core-routes.call: "*"
+  core-state.get: "*"
+  core-state.put: "*"
+  core-state.delete: "*"
+  core-state.list: "*"
+  # Materials' routes and events this module reads (its README, "For other
+  # extensions"), which it says only break with a new major.
+  com.github.aux.prusa3d.materials: ">=0.2.5 <1.0"
+
+calls:
+  - com.github.aux.prusa3d.materials
+
+# Read the printers' print events, their current print (device.jobs) and the
+# Materials events, as itself.
+permissions:
+  - observe
+
+openapi: openapi.json
+
+platforms:
+  - linux_amd64
+  - linux_arm64
+  - darwin_arm64
+
+egress:
+  - option: spoolbook_url
+    why: Records spool amounts and prints in the spoolbook library the operator names.
+    sends: The linked spool's id, its amount left, and per print the file name, date, tool and grams. The library token.
+
+options:
+  - key: spoolbook_url
+    type: url
+    default: https://spoolbook.unstablestudios.com
+    summary: The spoolbook address to send to.
+  - key: token
+    type: secret
+    required: true
+    summary: A library token from spoolbook (Manage libraries, then Tokens).
+  - key: library
+    type: string
+    required: true
+    summary: The spoolbook library id the token belongs to.
