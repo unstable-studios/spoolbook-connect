@@ -200,11 +200,11 @@ func (b *Bridge) reconcile(ctx context.Context, job Job) (bool, error) {
 		return true, err
 	}
 
-	if current != nil && current.ID == job.JobID {
+	if sameJob(current, job) {
 		return true, nil
 	}
 
-	if last != nil && last.ID == job.JobID && last.Ended != nil {
+	if sameJob(last, job) && last.Ended != nil {
 		b.Log.Info("a print ended without its settle event; settled from Connect's record",
 			"printer", job.DeviceID, "job", job.JobID, "outcome", last.Outcome)
 
@@ -221,6 +221,33 @@ func (b *Bridge) reconcile(ctx context.Context, job Job) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// startWindow is how far Connect's start of a print may be from when this
+// module saw it start, for a print whose start event carried no time.
+const startWindow = 15 * time.Minute
+
+// sameJob reports whether Connect's print is this one: the same id and the
+// same start, so a job id used again isn't taken for an older print.
+func sameJob(dj *DeviceJob, job Job) bool {
+	if dj == nil || dj.ID != job.JobID {
+		return false
+	}
+
+	if !job.JobStarted.IsZero() {
+		return dj.Started.Equal(job.JobStarted)
+	}
+
+	d := dj.Started.Sub(job.Started)
+
+	return d > -startWindow && d < startWindow
+}
+
+// forgetJobs drops a printer's cached device.jobs answer.
+func (b *Bridge) forgetJobs(deviceID string) {
+	b.cache.mu.Lock()
+	delete(b.cache.jobs, deviceID)
+	b.cache.mu.Unlock()
 }
 
 // Reconcile checks every open print against Connect, so a lost settle is
@@ -268,7 +295,18 @@ func (b *Bridge) settles(ctx context.Context) ([]Settle, error) {
 // OnJobSettled keeps the print for the settle worker and returns: working out
 // its grams waits for the weights, which mustn't hold up the event stream.
 func (b *Bridge) OnJobSettled(ctx context.Context, deviceID string, ev JobSettled) error {
+	// the event and a reconcile may both settle one print: one at a time,
+	// and the second finds the job gone
+	b.settleMu.Lock()
+	defer b.settleMu.Unlock()
+
 	key := jobKey(deviceID, ev.JobID)
+
+	if _, err := b.KV.Get(ctx, settleKey(deviceID, ev.JobID)); err == nil {
+		return nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
 
 	var job Job
 	if err := getJSON(ctx, b.KV, key, &job); err != nil {
@@ -383,6 +421,11 @@ func (b *Bridge) RunSettles(ctx context.Context) {
 func (b *Bridge) Settle(ctx context.Context, s Settle) {
 	key := settleKey(s.Job.DeviceID, s.Job.JobID)
 
+	// a listing from before another run finished it: nothing to do
+	if !b.settleKept(ctx, key) {
+		return
+	}
+
 	for ctx.Err() == nil {
 		err := b.settle(ctx, s)
 		if err == nil {
@@ -407,18 +450,59 @@ func (b *Bridge) Settle(ctx context.Context, s Settle) {
 				"printer", s.Job.DeviceID, "job", s.Job.JobID, "attempt", s.Attempts, "error", err)
 		}
 
-		_ = putJSON(ctx, b.KV, key, s)
+		b.settleMu.Lock()
+		kept := b.settleKept(ctx, key)
+		if kept {
+			_ = putJSON(ctx, b.KV, key, s)
+		}
+		b.settleMu.Unlock()
+
+		if !kept {
+			return
+		}
 
 		if b.Sleep(ctx, wait) != nil {
 			return
 		}
 	}
 
+	b.settleMu.Lock()
 	if err := b.KV.Delete(ctx, key); err != nil && !errors.Is(err, ErrNotFound) {
 		b.Log.Warn("could not remove a settled print", "key", key, "error", err)
 	}
+	b.settleMu.Unlock()
 
+	b.recheck(ctx, s.Job)
 	b.wake()
+}
+
+func (b *Bridge) settleKept(ctx context.Context, key string) bool {
+	_, err := b.KV.Get(ctx, key)
+
+	return err == nil
+}
+
+// recheck reads each linked spool of a settled print once more: an amount
+// left reported while it settled was held back, and goes now if it moved.
+func (b *Bridge) recheck(ctx context.Context, job Job) {
+	for _, t := range job.Tools {
+		if _, err := b.Links.Get(ctx, t.SpoolID); err != nil {
+			continue
+		}
+
+		spool, err := b.Materials.Spool(ctx, t.SpoolID)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				b.Log.Warn("could not read a spool after its print", "spool", t.SpoolID, "error", err)
+			}
+
+			continue
+		}
+
+		if err := b.OnSpool(ctx, SpoolEvent{SpoolID: spool.ID, Remaining: spool.Remaining}); err != nil {
+			b.Log.Warn("could not queue a spool's amount after its print", "spool", t.SpoolID, "error", err)
+		}
+	}
 }
 
 // linkedTools are the print's tools whose spools are linked.
@@ -453,7 +537,7 @@ func (b *Bridge) settle(ctx context.Context, s Settle) error {
 		return nil
 	}
 
-	tools, err := b.settledTools(ctx, s.Job.DeviceID, starts)
+	tools, err := b.settledTools(ctx, s.Job.DeviceID, starts, s.Queued)
 	if err != nil {
 		return err
 	}
@@ -509,10 +593,35 @@ func (b *Bridge) settle(ctx context.Context, s Settle) error {
 	return nil
 }
 
-// settledTools reads a printer's tools until the weights have settled: they
-// changed since the first read, and two reads SettleEvery apart agree. Or
-// else SettleFor has passed.
-func (b *Bridge) settledTools(ctx context.Context, deviceID string, starts []JobTool) ([]Tool, error) {
+// settledTools reads a printer's tools until the weights have settled: each
+// read matches what Materials' own spool events said after the settle, or
+// they changed since the first read and two reads SettleEvery apart agree.
+// Or else SettleFor has passed.
+func (b *Bridge) settledTools(ctx context.Context, deviceID string, starts []JobTool, since time.Time) ([]Tool, error) {
+	told := func(tools []Tool) bool {
+		for _, start := range starts {
+			found := false
+			for _, t := range tools {
+				if t.ToolID != start.ToolID {
+					continue
+				}
+
+				found = true
+				seen, ok := b.seen(start.SpoolID)
+				if t.SpoolID == nil || *t.SpoolID != start.SpoolID || !ok ||
+					seen.at.Before(since) || seen.remaining != round(max(t.Remaining, 0)) {
+					return false
+				}
+			}
+
+			if !found {
+				return false
+			}
+		}
+
+		return true
+	}
+
 	read := func() ([]Tool, string, error) {
 		tools, err := b.Materials.Tools(ctx, deviceID)
 		if err != nil {
@@ -541,6 +650,10 @@ func (b *Bridge) settledTools(ctx context.Context, deviceID string, starts []Job
 		return nil, err
 	}
 
+	if told(tools) {
+		return tools, nil
+	}
+
 	last := first
 	for waited := time.Duration(0); waited < SettleFor; waited += SettleEvery {
 		if err := b.Sleep(ctx, SettleEvery); err != nil {
@@ -552,7 +665,7 @@ func (b *Bridge) settledTools(ctx context.Context, deviceID string, starts []Job
 			return nil, err
 		}
 
-		if now != first && now == last {
+		if (now != first && now == last) || told(tools) {
 			return tools, nil
 		}
 

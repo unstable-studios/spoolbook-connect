@@ -137,6 +137,36 @@ type Bridge struct {
 	toolsLogged sync.Map
 	cache       readCache
 	settler     settler
+	settleMu    sync.Mutex
+
+	seenMu sync.Mutex
+	seenAt map[int64]seenWeight
+}
+
+// seenWeight is the last amount Materials reported for a spool, and when.
+type seenWeight struct {
+	remaining float64
+	at        time.Time
+}
+
+func (b *Bridge) see(spoolID int64, remaining float64) {
+	b.seenMu.Lock()
+	defer b.seenMu.Unlock()
+
+	if b.seenAt == nil {
+		b.seenAt = map[int64]seenWeight{}
+	}
+
+	b.seenAt[spoolID] = seenWeight{remaining: remaining, at: b.Now()}
+}
+
+func (b *Bridge) seen(spoolID int64) (seenWeight, bool) {
+	b.seenMu.Lock()
+	defer b.seenMu.Unlock()
+
+	w, ok := b.seenAt[spoolID]
+
+	return w, ok
 }
 
 // New wires a bridge over one store.
@@ -174,6 +204,8 @@ func (b *Bridge) OnSpool(ctx context.Context, ev SpoolEvent) error {
 	if ev.Deleted || ev.SpoolID <= 0 {
 		return nil
 	}
+
+	b.see(ev.SpoolID, round(max(ev.Remaining, 0)))
 
 	link, err := b.Links.Get(ctx, ev.SpoolID)
 	if errors.Is(err, ErrNotFound) {
@@ -251,6 +283,8 @@ func (b *Bridge) OnJobStarted(ctx context.Context, deviceID string, ev JobStarte
 		// a replay after a restart: the first reading is the one to keep
 		return nil
 	}
+
+	b.forgetJobs(deviceID)
 
 	tools, err := b.Materials.Tools(ctx, deviceID)
 	if err != nil {

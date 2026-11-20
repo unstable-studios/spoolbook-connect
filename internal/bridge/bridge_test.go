@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,10 +35,17 @@ type fakeMaterials struct {
 	calls    int
 	// fail fails the next calls to Tools
 	fail int
+	// onTools runs once, at the next call to Tools
+	onTools func()
 }
 
 func (m *fakeMaterials) Tools(_ context.Context, device string) ([]Tool, error) {
 	m.calls++
+	if m.onTools != nil {
+		m.onTools()
+		m.onTools = nil
+	}
+
 	if m.fail > 0 {
 		m.fail--
 		return nil, errors.New("materials down")
@@ -823,18 +831,29 @@ func (f fakeDevices) Jobs(context.Context, string) (*DeviceJob, *DeviceJob, erro
 func TestReconcileWithConnectsRecord(t *testing.T) {
 	t.Parallel()
 
+	started := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
 	ended := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+	earlier := started.Add(-24 * time.Hour)
 
 	cases := []struct {
 		name    string
 		devices fakeDevices
+		// noStart: the start event carried no time
+		noStart bool
 		// printing: spool 1's updates wait; settled: the print was recorded
 		printing, settled bool
 	}{
-		{"still current", fakeDevices{current: &DeviceJob{ID: "j1"}}, true, false},
-		{"another print now", fakeDevices{current: &DeviceJob{ID: "j9"}}, false, false},
-		{"idle, last is another", fakeDevices{last: &DeviceJob{ID: "j0", Ended: &ended}}, false, false},
-		{"idle, settle lost", fakeDevices{last: &DeviceJob{ID: "j1", Ended: &ended, Outcome: Finished, DisplayName: "Benchy"}}, true, true},
+		{"still current", fakeDevices{current: &DeviceJob{ID: "j1", Started: started}}, false, true, false},
+		{"another print now", fakeDevices{current: &DeviceJob{ID: "j9", Started: started}}, false, false, false},
+		{"idle, last is another", fakeDevices{last: &DeviceJob{ID: "j0", Started: started, Ended: &ended}}, false, false, false},
+		{"idle, settle lost", fakeDevices{last: &DeviceJob{ID: "j1", Started: started, Ended: &ended, Outcome: Finished, DisplayName: "Benchy"}}, false, true, true},
+		// the same job id, from an older print: not this one
+		{"reused id, last", fakeDevices{last: &DeviceJob{ID: "j1", Started: earlier, Ended: &ended, Outcome: Finished}}, false, false, false},
+		{"reused id, current", fakeDevices{current: &DeviceJob{ID: "j1", Started: earlier}}, false, false, false},
+		// no start time from the event: matched within the window of when
+		// this module saw it start
+		{"no start time, near", fakeDevices{last: &DeviceJob{ID: "j1", Started: newClock().now().Add(-time.Minute), Ended: &ended, Outcome: Finished}}, true, true, true},
+		{"no start time, far", fakeDevices{last: &DeviceJob{ID: "j1", Started: earlier, Ended: &ended, Outcome: Finished}}, true, false, false},
 	}
 
 	for _, tc := range cases {
@@ -845,7 +864,11 @@ func TestReconcileWithConnectsRecord(t *testing.T) {
 			b.Devices = tc.devices
 			ctx := context.Background()
 			m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
-			_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+			ev := JobStarted{JobID: "j1", Started: started}
+			if tc.noStart {
+				ev.Started = time.Time{}
+			}
+			_ = b.OnJobStarted(ctx, "p1", ev)
 
 			if got := b.printing(ctx, 1); got != tc.printing {
 				t.Errorf("printing = %v, want %v", got, tc.printing)
@@ -857,7 +880,7 @@ func TestReconcileWithConnectsRecord(t *testing.T) {
 			}
 
 			if tc.settled {
-				if s := settles[0]; s.Outcome != Finished || s.File != "Benchy" || !s.Ended.Equal(ended) {
+				if s := settles[0]; s.Outcome != Finished || !s.Ended.Equal(ended) {
 					t.Errorf("settle = %+v", s)
 				}
 			}
@@ -866,6 +889,145 @@ func TestReconcileWithConnectsRecord(t *testing.T) {
 				t.Errorf("jobs = %+v", jobs)
 			}
 		})
+	}
+}
+
+func TestStartForgetsCachedJobs(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	started := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
+	d := &switchDevices{current: &DeviceJob{ID: "j0", Started: started}}
+	b.Devices = d
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+
+	// cached: the printer's current print is j0
+	_, _, _ = b.cachedJobs(ctx, "p1")
+
+	d.current = &DeviceJob{ID: "j1", Started: started}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1", Started: started})
+
+	if !b.printing(ctx, 1) {
+		t.Error("a stale cached answer forgot the new print")
+	}
+}
+
+type switchDevices struct{ current *DeviceJob }
+
+func (s *switchDevices) Jobs(context.Context, string) (*DeviceJob, *DeviceJob, error) {
+	return s.current, nil, nil
+}
+
+func TestSettleOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+
+	// the event and a reconcile, at once
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() { _ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished}) })
+	}
+	wg.Wait()
+
+	settles, _ := b.settles(ctx)
+	if len(settles) != 1 {
+		t.Fatalf("settles = %+v", settles)
+	}
+
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 790}}
+	b.Settle(ctx, settles[0])
+
+	// a second run from an older listing does nothing
+	b.Settle(ctx, settles[0])
+
+	e := pending(t, b)
+	if len(e) != 1 || e[0].Body.Print.Grams != 10 {
+		t.Fatalf("queued %+v", e)
+	}
+
+	if s, _ := b.settles(ctx); len(s) != 0 {
+		t.Errorf("settles = %+v", s)
+	}
+}
+
+func TestSettleRetryDoesNotBringBackAFinishedRecord(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, kv := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+	settles, _ := b.settles(ctx)
+
+	// another run finishes it while this one's read is failing
+	m.fail = 1
+	m.onTools = func() { _ = kv.Delete(ctx, settleKey("p1", "j1")) }
+
+	b.Settle(ctx, settles[0])
+
+	if s, _ := b.settles(ctx); len(s) != 0 {
+		t.Errorf("brought back: %+v", s)
+	}
+
+	if e := pending(t, b); len(e) != 0 {
+		t.Errorf("queued %+v", e)
+	}
+}
+
+func TestSettleQueuesAnAmountHeldBack(t *testing.T) {
+	t.Parallel()
+
+	b, m, _, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 790}}
+	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+
+	// reported while it settled: held back
+	_ = b.OnSpool(ctx, SpoolEvent{SpoolID: 1, Remaining: 790})
+	settles, _ := b.settles(ctx)
+
+	// then an unload took 5 g more before the worker's last read
+	m.spools[1] = MaterialsSpool{ID: 1, Remaining: 785}
+	b.Settle(ctx, settles[0])
+
+	e := pending(t, b)
+	if len(e) != 2 || e[0].Body.Print == nil || e[1].Body.Print != nil || *e[1].Body.Remaining != 785 {
+		t.Fatalf("queued %+v", e)
+	}
+}
+
+func TestSettleAcceptsWhatMaterialsSaid(t *testing.T) {
+	t.Parallel()
+
+	b, m, c, _ := setup(t)
+	ctx := context.Background()
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 800}}
+	_ = b.OnJobStarted(ctx, "p1", JobStarted{JobID: "j1"})
+	m.tools["p1"] = []Tool{{ToolID: "0", SpoolID: id(1), Remaining: 780}}
+	_ = b.OnJobSettled(ctx, "p1", JobSettled{JobID: "j1", Outcome: Finished})
+
+	// Materials told of 780 after the settle: the first read agrees
+	_ = b.OnSpool(ctx, SpoolEvent{SpoolID: 1, Remaining: 780})
+	settles, _ := b.settles(ctx)
+
+	start := c.now()
+	m.calls = 0
+	b.Settle(ctx, settles[0])
+
+	if waited := c.now().Sub(start); waited != 0 || m.calls != 1 {
+		t.Errorf("waited %v over %d reads", waited, m.calls)
+	}
+
+	if e := pending(t, b); len(e) != 1 || e[0].Body.Print.Grams != 20 {
+		t.Fatalf("queued %+v", e)
 	}
 }
 
