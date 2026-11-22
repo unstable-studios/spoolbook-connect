@@ -36,7 +36,7 @@ import (
 const name = "spoolbook"
 
 // version is the release, kept equal to module.yaml's by release-please.
-const version = "0.2.0" // x-release-please-version
+const version = "0.2.1" // x-release-please-version
 
 //go:embed openapi.json
 var openAPI []byte
