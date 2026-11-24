@@ -1,5 +1,7 @@
 github.com/prusa3d/prusa-connect/sdk v0.1.0-beta.1 h1:nSlvXDOWl4cVSuLG7EeCWKgxpFkY6Tbdpvrr5+76OZY=
 github.com/prusa3d/prusa-connect/sdk v0.1.0-beta.1/go.mod h1:2XmDJsoDN1xJ5YzGnRJQTmHSRGGD8a9Njx/UiezPABw=
+github.com/prusa3d/prusa-connect/sdk v0.1.0-beta.2 h1:KvtU7tC8bXwnDlMiKWzKQGj2qY/V5T+qK5t53+ugo38=
+github.com/prusa3d/prusa-connect/sdk v0.1.0-beta.2/go.mod h1:2XmDJsoDN1xJ5YzGnRJQTmHSRGGD8a9Njx/UiezPABw=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
